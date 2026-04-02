@@ -17,6 +17,7 @@ wheels/
 
 .env
 .env.*
+!.env.example
 
 data/*.json
 !data/*.example.json
