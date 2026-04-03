@@ -536,10 +536,10 @@ def iter_anthropic_sse_events(
         except json.JSONDecodeError:
             continue
 
-        wrapped_raw = payload.get("raw_response_json") if isinstance(payload, dict) else None
-        if isinstance(payload, dict) and payload.get("turn_complete") and wrapped_raw is None:
+        if isinstance(payload, dict) and payload.get("turn_complete"):
             continue
 
+        wrapped_raw = payload.get("raw_response_json") if isinstance(payload, dict) else None
         raw_event = _parse_raw_event(wrapped_raw if wrapped_raw is not None else payload)
         if not raw_event:
             continue
@@ -557,12 +557,21 @@ def iter_anthropic_sse_events(
                 started = True
                 message = event_payload.get("message")
                 if isinstance(message, dict):
+                    message.setdefault("type", "message")
                     message["model"] = model
+                    message.setdefault("stop_reason", None)
+                    message.setdefault("stop_sequence", None)
+                    usage = message.get("usage")
+                    if not isinstance(usage, dict):
+                        message["usage"] = {
+                            "input_tokens": 0,
+                            "output_tokens": 0,
+                        }
+                    else:
+                        usage.setdefault("input_tokens", 0)
+                        usage.setdefault("output_tokens", 0)
 
             yield event_name, event_payload
-
-    if started:
-        yield "message_stop", {"type": "message_stop"}
 
 
 def iter_anthropic_sse_bytes(
