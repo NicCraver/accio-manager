@@ -334,6 +334,8 @@ class AccountStore:
             if not account:
                 return None
             account.manual_enabled = enabled
+            if enabled and not account.auto_disabled:
+                account.auto_disabled_reason = None
             account.updated_at = now_text()
             self._write_account_unlocked(account)
             return account

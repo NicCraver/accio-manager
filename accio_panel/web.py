@@ -157,10 +157,10 @@ def _import_callback_account(
         cookie=cookie,
     )
     activation = _activate_callback_account(client, account, panel_settings)
-    account, quota = _apply_quota_result(
+    account, quota = _query_quota_with_refresh_fallback(
         store,
+        client,
         account,
-        _query_quota(client, account, panel_settings),
         panel_settings,
     )
     return account, quota, created, activation
@@ -185,6 +185,14 @@ def _proxy_fill_sort_key(account: Account, quota: dict[str, Any]) -> tuple[Any, 
 
 def _account_status_view(account: Account) -> dict[str, Any]:
     if not account.manual_enabled:
+        disabled_reason = str(account.auto_disabled_reason or "").strip()
+        if disabled_reason:
+            return {
+                "effective_enabled": False,
+                "label": "异常禁用",
+                "level": "auto",
+                "hint": disabled_reason,
+            }
         return {
             "effective_enabled": False,
             "label": "手动禁用",
@@ -278,16 +286,89 @@ def _refresh_token(
     )
 
 
+def _disable_account_after_refresh_failure(
+    store: AccountStore,
+    account: Account,
+    reason: str,
+) -> Account:
+    now_ts = _now_timestamp()
+    updated = store.set_manual_enabled(account.id, False)
+    if not updated:
+        account.manual_enabled = False
+        account.auto_disabled = False
+        account.auto_disabled_reason = reason
+        account.last_quota_check_at = now_ts
+        account.next_quota_check_at = None
+        account.next_quota_check_reason = None
+        return account
+    updated.auto_disabled = False
+    updated.auto_disabled_reason = reason
+    updated.last_quota_check_at = now_ts
+    updated.next_quota_check_at = None
+    updated.next_quota_check_reason = None
+    store.save(updated)
+    return updated
+
+
+def _query_quota_with_refresh_fallback(
+    store: AccountStore,
+    client: AccioClient,
+    account: Account,
+    panel_settings: PanelSettings,
+) -> tuple[Account, dict[str, Any]]:
+    quota_result = _query_quota(client, account, panel_settings)
+    if not account.manual_enabled:
+        return _apply_quota_result(store, account, quota_result, panel_settings)
+    if quota_result.get("success"):
+        return _apply_quota_result(store, account, quota_result, panel_settings)
+
+    refresh_result = _refresh_token(client, account, panel_settings)
+    if not refresh_result.get("success"):
+        reason = (
+            "额度查询失败，且 Token 刷新失败："
+            f"{refresh_result.get('message') or '刷新失败'}。系统已自动禁用该账号，请手动处理。"
+        )
+        disabled_account = _disable_account_after_refresh_failure(store, account, reason)
+        failed_quota = _build_quota_view(quota_result)
+        failed_quota["message"] = reason
+        return disabled_account, failed_quota
+
+    refreshed_data = refresh_result.get("data") or {}
+    updated_account = store.update_tokens(
+        account.id,
+        access_token=str(refreshed_data.get("accessToken") or account.access_token),
+        refresh_token=str(refreshed_data.get("refreshToken") or account.refresh_token),
+        expires_at=refreshed_data.get("expiresAt"),
+    )
+    if updated_account:
+        updated_account.next_quota_check_at = _now_timestamp()
+        updated_account.next_quota_check_reason = "额度查询失败后自动刷新 Token 并重试额度"
+        store.save(updated_account)
+        account = updated_account
+
+    retried_quota_result = _query_quota(client, account, panel_settings)
+    account, quota = _apply_quota_result(store, account, retried_quota_result, panel_settings)
+    if quota["success"]:
+        quota["message"] = quota["message"] or "额度查询失败后已自动刷新 Token 并恢复。"
+    else:
+        retry_message = str(quota.get("message") or "").strip()
+        quota["message"] = (
+            "额度查询失败，已自动刷新 Token 并重试，但额度查询仍失败。"
+            + (f" {retry_message}" if retry_message else "")
+        ).strip()
+    return account, quota
+
+
 def _check_proxy_candidate(
     store: AccountStore,
     client: AccioClient,
     panel_settings: PanelSettings,
     account: Account,
 ) -> tuple[Account, dict[str, Any]]:
-    return _apply_quota_result(
+    return _query_quota_with_refresh_fallback(
         store,
+        client,
         account,
-        _query_quota(client, account, panel_settings),
         panel_settings,
     )
 
@@ -605,12 +686,18 @@ def _build_dashboard_items(
     if not accounts:
         return []
 
-    quota_map: dict[str, dict[str, Any]] = {}
+    quota_map: dict[str, tuple[Account, dict[str, Any]]] = {}
     workers = min(8, len(accounts))
 
     with ThreadPoolExecutor(max_workers=workers) as executor:
         future_map = {
-            executor.submit(_query_quota, client, account, panel_settings): account.id
+            executor.submit(
+                _query_quota_with_refresh_fallback,
+                store,
+                client,
+                account,
+                panel_settings,
+            ): account.id
             for account in accounts
         }
         for future in as_completed(future_map):
@@ -618,15 +705,27 @@ def _build_dashboard_items(
             try:
                 quota_map[account_id] = future.result()
             except Exception as exc:  # pragma: no cover
-                quota_map[account_id] = {"success": False, "message": str(exc)}
+                fallback_account = store.get_account(account_id)
+                if fallback_account is None:
+                    fallback_account = next(
+                        (candidate for candidate in accounts if candidate.id == account_id),
+                        None,
+                    )
+                if fallback_account is None:
+                    continue
+                quota_map[account_id] = (
+                    fallback_account,
+                    _build_quota_view({"success": False, "message": str(exc)}),
+                )
 
     items: list[dict[str, Any]] = []
     for account in accounts:
-        account, quota_view = _apply_quota_result(
-            store,
-            account,
-            quota_map.get(account.id, {}),
-            panel_settings,
+        account, quota_view = quota_map.get(
+            account.id,
+            (
+                account,
+                _build_quota_view({"success": False, "message": "额度查询失败"}),
+            ),
         )
         status = _account_status_view(account)
         items.append(
@@ -676,13 +775,13 @@ async def _quota_scheduler_loop(application: FastAPI) -> None:
                 due_accounts.append(account)
 
         for account in due_accounts:
-            quota_result = await asyncio.to_thread(
-                _query_quota,
+            await asyncio.to_thread(
+                _query_quota_with_refresh_fallback,
+                store,
                 client,
                 account,
                 panel_settings,
             )
-            _apply_quota_result(store, account, quota_result, panel_settings)
 
         await asyncio.sleep(SCHEDULER_TICK_SECONDS)
 
@@ -1279,10 +1378,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             )
 
         panel_settings = panel_settings_store.load()
-        account, quota = _apply_quota_result(
+        account, quota = _query_quota_with_refresh_fallback(
             store,
+            client,
             account,
-            _query_quota(client, account, panel_settings),
             panel_settings,
         )
 
@@ -1430,6 +1529,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             cleared = store.set_auto_disabled(account_id, False, None)
             if cleared:
                 updated = cleared
+        if enabled and updated.auto_disabled_reason:
+            updated.auto_disabled_reason = None
         updated.next_quota_check_at = _now_timestamp() if enabled else None
         updated.next_quota_check_reason = (
             "手动切换启用状态后立即检查额度" if enabled else None
@@ -1559,10 +1660,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 updated.next_quota_check_at = _now_timestamp()
                 updated.next_quota_check_reason = "批量刷新 Token 后立即检查额度"
                 store.save(updated)
-                _apply_quota_result(
+                _query_quota_with_refresh_fallback(
                     store,
+                    client,
                     updated,
-                    _query_quota(client, updated, panel_settings),
                     panel_settings,
                 )
                 success_count += 1
@@ -1648,20 +1749,20 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 updated.next_quota_check_at = _now_timestamp()
                 updated.next_quota_check_reason = "批量刷新 Token 后立即检查额度"
                 store.save(updated)
-                _apply_quota_result(
+                _query_quota_with_refresh_fallback(
                     store,
+                    client,
                     updated,
-                    _query_quota(client, updated, panel_settings),
                     panel_settings,
                 )
                 success_count += 1
                 continue
 
             if action == "refresh_quota":
-                _, quota = _apply_quota_result(
+                _, quota = _query_quota_with_refresh_fallback(
                     store,
+                    client,
                     account,
-                    _query_quota(client, account, panel_settings),
                     panel_settings,
                 )
                 if not quota["success"]:
@@ -1681,6 +1782,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     cleared = store.set_auto_disabled(account_id, False, None)
                     if cleared:
                         updated = cleared
+                if updated.auto_disabled_reason:
+                    updated.auto_disabled_reason = None
                 updated.next_quota_check_at = _now_timestamp()
                 updated.next_quota_check_reason = "批量启用后立即检查额度"
                 store.save(updated)
@@ -1835,10 +1938,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             )
 
         panel_settings = panel_settings_store.load()
-        account, quota = _apply_quota_result(
+        account, quota = _query_quota_with_refresh_fallback(
             store,
+            client,
             account,
-            _query_quota(client, account, panel_settings),
             panel_settings,
         )
         return JSONResponse(
