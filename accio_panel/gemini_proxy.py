@@ -437,22 +437,32 @@ def _normalize_response_part(part: dict[str, Any]) -> dict[str, Any]:
 
     inline_data = part.get("inlineData", part.get("inline_data"))
     if isinstance(inline_data, dict):
+        mime_type = str(
+            inline_data.get("mimeType", inline_data.get("mime_type")) or ""
+        )
+        data = str(inline_data.get("data") or "")
         normalized["inlineData"] = {
-            "mimeType": str(
-                inline_data.get("mimeType", inline_data.get("mime_type")) or ""
-            ),
-            "data": str(inline_data.get("data") or ""),
+            "mimeType": mime_type,
+            "data": data,
+        }
+        normalized["inline_data"] = {
+            "mime_type": mime_type,
+            "data": data,
         }
 
     file_data = part.get("fileData", part.get("file_data"))
     if isinstance(file_data, dict):
+        file_uri = str(file_data.get("fileUri", file_data.get("file_uri")) or "")
+        mime_type = str(
+            file_data.get("mimeType", file_data.get("mime_type")) or ""
+        )
         normalized["fileData"] = {
-            "fileUri": str(
-                file_data.get("fileUri", file_data.get("file_uri")) or ""
-            ),
-            "mimeType": str(
-                file_data.get("mimeType", file_data.get("mime_type")) or ""
-            ),
+            "fileUri": file_uri,
+            "mimeType": mime_type,
+        }
+        normalized["file_data"] = {
+            "file_uri": file_uri,
+            "mime_type": mime_type,
         }
 
     function_call = part.get("functionCall", part.get("function_call"))
@@ -460,15 +470,23 @@ def _normalize_response_part(part: dict[str, Any]) -> dict[str, Any]:
         args_value = function_call.get("args")
         if args_value is None:
             args_value = _parse_json_value(function_call.get("argsJson"))
+        call_id = str(
+            function_call.get("id")
+            or function_call.get("callId")
+            or function_call.get("name")
+            or uuid.uuid4().hex
+        )
+        call_name = str(function_call.get("name") or "")
+        call_args = args_value if args_value is not None else {}
         normalized["functionCall"] = {
-            "id": str(
-                function_call.get("id")
-                or function_call.get("callId")
-                or function_call.get("name")
-                or uuid.uuid4().hex
-            ),
-            "name": str(function_call.get("name") or ""),
-            "args": args_value if args_value is not None else {},
+            "id": call_id,
+            "name": call_name,
+            "args": call_args,
+        }
+        normalized["function_call"] = {
+            "id": call_id,
+            "name": call_name,
+            "args": call_args,
         }
 
     function_response = part.get("functionResponse", part.get("function_response"))
@@ -476,15 +494,23 @@ def _normalize_response_part(part: dict[str, Any]) -> dict[str, Any]:
         response_value = function_response.get("response")
         if response_value is None:
             response_value = _parse_json_value(function_response.get("responseJson"))
+        call_id = str(
+            function_response.get("id")
+            or function_response.get("callId")
+            or function_response.get("name")
+            or uuid.uuid4().hex
+        )
+        call_name = str(function_response.get("name") or "")
+        call_response = response_value if response_value is not None else {}
         normalized["functionResponse"] = {
-            "id": str(
-                function_response.get("id")
-                or function_response.get("callId")
-                or function_response.get("name")
-                or uuid.uuid4().hex
-            ),
-            "name": str(function_response.get("name") or ""),
-            "response": response_value if response_value is not None else {},
+            "id": call_id,
+            "name": call_name,
+            "response": call_response,
+        }
+        normalized["function_response"] = {
+            "id": call_id,
+            "name": call_name,
+            "response": call_response,
         }
 
     return normalized
@@ -527,6 +553,7 @@ def _normalize_candidate(candidate: Any, index: int, fallback_finish_reason: str
             "parts": parts,
         },
         "finishReason": finish_reason,
+        "finish_reason": finish_reason,
     }
 
 
@@ -607,17 +634,22 @@ def normalize_gemini_response_payload(
     if usage_source is None:
         usage_source = fallback_usage or {}
 
+    normalized_usage = _normalize_usage_metadata(usage_source)
+    normalized_model_version = str(
+        payload.get("modelVersion", payload.get("model_version")) or model
+    )
     normalized: dict[str, Any] = {
         "candidates": candidates,
-        "usageMetadata": _normalize_usage_metadata(usage_source),
-        "modelVersion": str(
-            payload.get("modelVersion", payload.get("model_version")) or model
-        ),
+        "usageMetadata": normalized_usage,
+        "usage_metadata": normalized_usage,
+        "modelVersion": normalized_model_version,
+        "model_version": normalized_model_version,
     }
 
     prompt_feedback = payload.get("promptFeedback", payload.get("prompt_feedback"))
     if isinstance(prompt_feedback, dict):
         normalized["promptFeedback"] = prompt_feedback
+        normalized["prompt_feedback"] = prompt_feedback
 
     return normalized
 
@@ -731,14 +763,17 @@ def _merge_gemini_response_payload(
     incoming_usage = normalized_incoming.get("usageMetadata")
     if isinstance(incoming_usage, dict) and incoming_usage:
         merged["usageMetadata"] = incoming_usage
+        merged["usage_metadata"] = incoming_usage
 
     incoming_feedback = normalized_incoming.get("promptFeedback")
     if isinstance(incoming_feedback, dict) and incoming_feedback:
         merged["promptFeedback"] = incoming_feedback
+        merged["prompt_feedback"] = incoming_feedback
 
     incoming_model_version = normalized_incoming.get("modelVersion")
     if incoming_model_version:
         merged["modelVersion"] = incoming_model_version
+        merged["model_version"] = incoming_model_version
     return merged
 
 
@@ -945,19 +980,8 @@ def iter_gemini_generate_content_sse_bytes(
     model: str,
     on_complete: Callable[[dict[str, Any]], None] | None = None,
 ) -> Iterator[bytes]:
-    if _is_image_generation_model(model):
-        payload = decode_gemini_generate_content_response(response, model)
-        summary = summarize_gemini_response(payload)
-        summary["usage"] = extract_gemini_usage(payload)
-        summary["stop_reason"] = extract_gemini_finish_reason(payload)
-        try:
-            yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n".encode("utf-8")
-        finally:
-            if on_complete is not None:
-                on_complete(summary)
-        return
-
     latest_payload: dict[str, Any] | None = None
+    last_chunk_had_image = False
     summary = {
         "text_chars": 0,
         "tool_use_blocks": 0,
@@ -1025,18 +1049,49 @@ def iter_gemini_generate_content_sse_bytes(
             summary["empty_response"] = False
             summary["usage"] = usage
             summary["stop_reason"] = extract_gemini_finish_reason(payload)
+            last_chunk_had_image = bool(chunk_summary["has_image_data"])
             yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n".encode("utf-8")
-    finally:
-        if latest_payload is not None and bool(summary["empty_response"]):
+
+        if (
+            _is_image_generation_model(model)
+            and isinstance(latest_payload, dict)
+            and latest_payload
+        ):
             final_summary = summarize_gemini_response(latest_payload)
-            summary["text_chars"] = int(final_summary["text_chars"])
-            summary["tool_use_blocks"] = int(final_summary["tool_use_blocks"])
-            summary["image_blocks"] = int(final_summary["image_blocks"])
-            summary["has_image_data"] = bool(final_summary["has_image_data"])
+            if bool(final_summary["has_image_data"]) and not last_chunk_had_image:
+                yield (
+                    f"data: {json.dumps(latest_payload, ensure_ascii=False)}\n\n".encode(
+                        "utf-8"
+                    )
+                )
+    finally:
+        if latest_payload is not None:
+            final_summary = summarize_gemini_response(latest_payload)
+            summary["text_chars"] = max(
+                int(summary["text_chars"]),
+                int(final_summary["text_chars"]),
+            )
+            summary["tool_use_blocks"] = max(
+                int(summary["tool_use_blocks"]),
+                int(final_summary["tool_use_blocks"]),
+            )
+            summary["image_blocks"] = max(
+                int(summary["image_blocks"]),
+                int(final_summary["image_blocks"]),
+            )
+            summary["has_image_data"] = bool(summary["has_image_data"]) or bool(
+                final_summary["has_image_data"]
+            )
             summary["image_mime_types"] = list(final_summary.get("image_mime_types", []))
             summary["image_sources"] = list(final_summary.get("image_sources", []))
-            summary["image_data_chars"] = int(final_summary["image_data_chars"])
-            summary["image_data_bytes"] = int(final_summary["image_data_bytes"])
+            summary["image_data_chars"] = max(
+                int(summary["image_data_chars"]),
+                int(final_summary["image_data_chars"]),
+            )
+            summary["image_data_bytes"] = max(
+                int(summary["image_data_bytes"]),
+                int(final_summary["image_data_bytes"]),
+            )
             summary["empty_response"] = bool(final_summary["empty_response"])
             summary["usage"] = extract_gemini_usage(latest_payload)
             summary["stop_reason"] = extract_gemini_finish_reason(latest_payload)
