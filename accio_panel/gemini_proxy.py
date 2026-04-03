@@ -618,11 +618,168 @@ def normalize_gemini_response_payload(
     return normalized
 
 
+def _merge_gemini_parts(
+    existing_parts: list[dict[str, Any]],
+    incoming_parts: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    merged = [dict(part) for part in existing_parts]
+    for index, incoming_part in enumerate(incoming_parts):
+        if index >= len(merged):
+            merged.append(dict(incoming_part))
+            continue
+
+        current_part = dict(merged[index])
+        incoming_text = incoming_part.get("text")
+        current_text = current_part.get("text")
+        if incoming_text is not None:
+            current_part["text"] = f"{current_text or ''}{incoming_text}"
+
+        for key in (
+            "inlineData",
+            "fileData",
+            "functionCall",
+            "functionResponse",
+            "thought",
+            "thoughtSignature",
+        ):
+            if incoming_part.get(key) is not None:
+                current_part[key] = incoming_part.get(key)
+        merged[index] = current_part
+    return merged
+
+
+def _merge_gemini_candidates(
+    existing_candidates: list[dict[str, Any]],
+    incoming_candidates: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    merged = [dict(candidate) for candidate in existing_candidates]
+    for index, incoming_candidate in enumerate(incoming_candidates):
+        if index >= len(merged):
+            merged.append(dict(incoming_candidate))
+            continue
+
+        current_candidate = dict(merged[index])
+        incoming_content = incoming_candidate.get("content")
+        current_content = current_candidate.get("content")
+        if isinstance(incoming_content, dict):
+            current_content = dict(current_content) if isinstance(current_content, dict) else {}
+            incoming_parts = incoming_content.get("parts")
+            current_parts = current_content.get("parts")
+            if isinstance(incoming_parts, list):
+                current_content["parts"] = _merge_gemini_parts(
+                    current_parts if isinstance(current_parts, list) else [],
+                    [part for part in incoming_parts if isinstance(part, dict)],
+                )
+            if incoming_content.get("role") is not None:
+                current_content["role"] = incoming_content.get("role")
+            current_candidate["content"] = current_content
+
+        if incoming_candidate.get("finishReason") is not None:
+            current_candidate["finishReason"] = incoming_candidate.get("finishReason")
+        merged[index] = current_candidate
+    return merged
+
+
+def _merge_gemini_response_payload(
+    base_payload: dict[str, Any] | None,
+    incoming_payload: dict[str, Any],
+    *,
+    model: str,
+    fallback_usage: dict[str, Any] | None = None,
+    fallback_finish_reason: str | None = None,
+) -> dict[str, Any]:
+    normalized_incoming = normalize_gemini_response_payload(
+        incoming_payload,
+        model=model,
+        fallback_usage=fallback_usage,
+        fallback_finish_reason=fallback_finish_reason,
+    )
+    if not isinstance(base_payload, dict) or not base_payload:
+        return normalized_incoming
+
+    merged = dict(base_payload)
+    merged["candidates"] = _merge_gemini_candidates(
+        base_payload.get("candidates")
+        if isinstance(base_payload.get("candidates"), list)
+        else [],
+        normalized_incoming.get("candidates")
+        if isinstance(normalized_incoming.get("candidates"), list)
+        else [],
+    )
+
+    incoming_usage = normalized_incoming.get("usageMetadata")
+    if isinstance(incoming_usage, dict) and incoming_usage:
+        merged["usageMetadata"] = incoming_usage
+
+    incoming_feedback = normalized_incoming.get("promptFeedback")
+    if isinstance(incoming_feedback, dict) and incoming_feedback:
+        merged["promptFeedback"] = incoming_feedback
+
+    incoming_model_version = normalized_incoming.get("modelVersion")
+    if incoming_model_version:
+        merged["modelVersion"] = incoming_model_version
+    return merged
+
+
+def iter_gemini_generate_content_payloads(
+    response: requests.Response,
+    model: str,
+) -> Iterator[dict[str, Any]]:
+    wrapper_usage: dict[str, Any] | None = None
+    wrapper_finish_reason: str | None = None
+    try:
+        for raw_line in response.iter_lines(decode_unicode=True):
+            line = (raw_line or "").strip()
+            if not line or line.startswith(":"):
+                continue
+
+            json_text = line[5:].strip() if line.startswith("data:") else line
+            if json_text == "[DONE]":
+                continue
+
+            event_payload = _parse_json_dict(json_text)
+            if not event_payload:
+                continue
+
+            usage_candidate = event_payload.get(
+                "usageMetadata",
+                event_payload.get("usage_metadata"),
+            )
+            if isinstance(usage_candidate, dict):
+                wrapper_usage = usage_candidate
+
+            finish_candidate = event_payload.get(
+                "finishReason",
+                event_payload.get("finish_reason"),
+            )
+            if finish_candidate:
+                wrapper_finish_reason = str(finish_candidate)
+
+            raw_candidate = event_payload.get("raw_response_json")
+            source_payload: dict[str, Any] | None = None
+            if raw_candidate is not None:
+                source_payload = _parse_json_dict(raw_candidate)
+            elif isinstance(event_payload.get("candidates"), list):
+                source_payload = event_payload
+
+            if not source_payload:
+                continue
+
+            yield normalize_gemini_response_payload(
+                source_payload,
+                model=model,
+                fallback_usage=wrapper_usage,
+                fallback_finish_reason=wrapper_finish_reason,
+            )
+    finally:
+        response.close()
+
+
 def decode_gemini_generate_content_response(
     response: requests.Response,
     model: str,
 ) -> dict[str, Any]:
-    raw_payload: dict[str, Any] | None = None
+    merged_payload: dict[str, Any] | None = None
     wrapper_usage: dict[str, Any] | None = None
     wrapper_finish_reason: str | None = None
 
@@ -658,23 +815,30 @@ def decode_gemini_generate_content_response(
             if raw_candidate is not None:
                 parsed_raw = _parse_json_dict(raw_candidate)
                 if parsed_raw:
-                    raw_payload = parsed_raw
+                    merged_payload = _merge_gemini_response_payload(
+                        merged_payload,
+                        parsed_raw,
+                        model=model,
+                        fallback_usage=wrapper_usage,
+                        fallback_finish_reason=wrapper_finish_reason,
+                    )
                     continue
 
             if isinstance(event_payload.get("candidates"), list):
-                raw_payload = event_payload
+                merged_payload = _merge_gemini_response_payload(
+                    merged_payload,
+                    event_payload,
+                    model=model,
+                    fallback_usage=wrapper_usage,
+                    fallback_finish_reason=wrapper_finish_reason,
+                )
     finally:
         response.close()
 
-    if raw_payload is None:
+    if merged_payload is None:
         raise ValueError("上游未返回有效的 Gemini 响应。")
 
-    return normalize_gemini_response_payload(
-        raw_payload,
-        model=model,
-        fallback_usage=wrapper_usage,
-        fallback_finish_reason=wrapper_finish_reason,
-    )
+    return merged_payload
 
 
 def build_gemini_generate_content_response(
@@ -690,13 +854,48 @@ def iter_gemini_generate_content_sse_bytes(
     model: str,
     on_complete: Callable[[dict[str, Any]], None] | None = None,
 ) -> Iterator[bytes]:
-    payload = decode_gemini_generate_content_response(response, model)
-    summary = summarize_gemini_response(payload)
-    summary["usage"] = extract_gemini_usage(payload)
-    summary["stop_reason"] = extract_gemini_finish_reason(payload)
+    latest_payload: dict[str, Any] | None = None
+    summary = {
+        "text_chars": 0,
+        "tool_use_blocks": 0,
+        "image_blocks": 0,
+        "empty_response": True,
+        "usage": {
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "total_tokens": 0,
+            "thought_tokens": 0,
+        },
+        "stop_reason": "STOP",
+    }
     try:
-        yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n".encode("utf-8")
+        for payload in iter_gemini_generate_content_payloads(response, model):
+            latest_payload = _merge_gemini_response_payload(
+                latest_payload,
+                payload,
+                model=model,
+            )
+            chunk_summary = summarize_gemini_response(payload)
+            usage = extract_gemini_usage(payload)
+            summary["text_chars"] = int(summary["text_chars"]) + int(chunk_summary["text_chars"])
+            summary["tool_use_blocks"] = int(summary["tool_use_blocks"]) + int(chunk_summary["tool_use_blocks"])
+            summary["image_blocks"] = max(
+                int(summary["image_blocks"]),
+                int(chunk_summary["image_blocks"]),
+            )
+            summary["empty_response"] = False
+            summary["usage"] = usage
+            summary["stop_reason"] = extract_gemini_finish_reason(payload)
+            yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n".encode("utf-8")
     finally:
+        if latest_payload is not None and bool(summary["empty_response"]):
+            final_summary = summarize_gemini_response(latest_payload)
+            summary["text_chars"] = int(final_summary["text_chars"])
+            summary["tool_use_blocks"] = int(final_summary["tool_use_blocks"])
+            summary["image_blocks"] = int(final_summary["image_blocks"])
+            summary["empty_response"] = bool(final_summary["empty_response"])
+            summary["usage"] = extract_gemini_usage(latest_payload)
+            summary["stop_reason"] = extract_gemini_finish_reason(latest_payload)
         if on_complete is not None:
             on_complete(summary)
 
