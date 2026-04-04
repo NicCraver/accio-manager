@@ -38,7 +38,7 @@ jobs:
       - name: Build onefile binary with Nuitka
         uses: Nuitka/Nuitka-Action@v1.3
         with:
-          nuitka-version: 4.0
+          nuitka-version: "4.0"
           script-name: main.py
           mode: onefile
           output-dir: build
