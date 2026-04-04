@@ -1,0 +1,54 @@
+name: Build Linux Onefile
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: read
+
+jobs:
+  build-linux-amd64:
+    name: Build Linux amd64 onefile
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          architecture: "x64"
+          cache: "pip"
+          cache-dependency-path: pyproject.toml
+
+      - name: Install project dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install .
+
+      - name: Validate release tag
+        env:
+          GITHUB_REF_NAME: ${{ github.ref_name }}
+        run: python scripts/validate_release_tag.py
+
+      - name: Build onefile binary with Nuitka
+        uses: Nuitka/Nuitka-Action@v1.3
+        with:
+          nuitka-version: 4.0
+          script-name: main.py
+          mode: onefile
+          output-dir: build
+          output-file: accio-panel-linux-amd64-${{ github.ref_name }}
+          include-package-data: accio_panel
+          assume-yes-for-downloads: true
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: accio-panel-linux-amd64-${{ github.ref_name }}
+          path: build/accio-panel-linux-amd64-${{ github.ref_name }}
+          if-no-files-found: error

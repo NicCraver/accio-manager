@@ -1,12 +1,36 @@
 from __future__ import annotations
 
 import os
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import unquote, urlparse
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
+
+def _compiled_containing_dir() -> Path | None:
+    compiled = globals().get("__compiled__")
+    containing_dir = getattr(compiled, "containing_dir", "")
+    if containing_dir:
+        return Path(str(containing_dir))
+
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+
+    return None
+
+
+def _runtime_root() -> Path:
+    return _compiled_containing_dir() or PROJECT_ROOT
+
+
+def _default_data_dir() -> Path:
+    configured = os.getenv("ACCIO_DATA_DIR", "").strip()
+    if configured:
+        return Path(configured)
+    return _runtime_root() / "data"
 
 
 def _env_flag(name: str, default: bool) -> bool:
@@ -28,11 +52,7 @@ class Settings:
     callback_port: int = int(os.getenv("ACCIO_CALLBACK_PORT", "4097"))
     request_timeout: float = float(os.getenv("ACCIO_REQUEST_TIMEOUT", "15"))
     auto_open_browser: bool = _env_flag("ACCIO_AUTO_OPEN_BROWSER", True)
-    data_dir: Path = field(
-        default_factory=lambda: Path(
-            os.getenv("ACCIO_DATA_DIR", str(PROJECT_ROOT / "data"))
-        )
-    )
+    data_dir: Path = field(default_factory=_default_data_dir)
     database_url: str = os.getenv("ACCIO_MYSQL", "").strip()
     mysql_host: str = os.getenv("ACCIO_MYSQL_HOST", "").strip()
     mysql_port: int = int(os.getenv("ACCIO_MYSQL_PORT", "3306"))

@@ -49,6 +49,32 @@ class _FakeGateway:
 
 
 class RuntimeStorageTests(unittest.TestCase):
+    def test_settings_uses_binary_adjacent_data_dir_when_running_from_nuitka(self):
+        import accio_panel.config as config_module
+
+        compiled = type("Compiled", (), {"containing_dir": "/tmp/accio-dist"})()
+
+        with patch.dict(os.environ, {}, clear=True):
+            with patch.object(config_module, "__compiled__", compiled, create=True):
+                settings = config_module.Settings()
+
+        self.assertEqual(settings.data_dir, Path("/tmp/accio-dist/data"))
+
+    def test_settings_prefers_accio_data_dir_over_compiled_default(self):
+        import accio_panel.config as config_module
+
+        compiled = type("Compiled", (), {"containing_dir": "/tmp/accio-dist"})()
+
+        with patch.dict(
+            os.environ,
+            {"ACCIO_DATA_DIR": "/var/lib/accio-data"},
+            clear=True,
+        ):
+            with patch.object(config_module, "__compiled__", compiled, create=True):
+                settings = config_module.Settings()
+
+        self.assertEqual(settings.data_dir, Path("/var/lib/accio-data"))
+
     def test_settings_reads_mysql_dsn_from_accio_mysql(self):
         import accio_panel.config as config_module
 

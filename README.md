@@ -53,6 +53,28 @@ uv run python main.py
 - `http://127.0.0.1:4097/v1beta/models`
 - `http://127.0.0.1:4097/dashboard?view=logs`
 
+## GitHub Actions 单文件发布
+
+仓库内置了 `.github/workflows/build-linux-onefile.yml`：
+
+- 仅在推送 `vX.Y.Z` tag 时触发，例如 `v0.1.0`
+- 使用 `Nuitka/Nuitka-Action` 在 GitHub Linux runner 上构建 `linux amd64` 单文件
+- 构建前会校验 tag 与 `pyproject.toml` 中的 `project.version` 完全一致
+- 产物会以 Actions artifact 形式上传，名称为 `accio-panel-linux-amd64-<tag>`
+
+发布示例：
+
+```bash
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+单文件运行时说明：
+
+- `accio_panel/templates` 会作为包数据打进 onefile，页面模板可直接使用
+- 未设置 `ACCIO_DATA_DIR` 时，默认数据目录会落在可执行文件同级的 `data/`
+- 设置了 `ACCIO_DATA_DIR` 时，仍然以该环境变量为准
+
 ## Docker
 
 直接拉取镜像（推荐）：
