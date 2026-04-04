@@ -32,6 +32,14 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install .
 
+      - name: Cache Nuitka compilation
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/Nuitka
+          key: nuitka-${{ runner.os }}-${{ hashFiles('accio_panel/**/*.py', 'main.py') }}
+          restore-keys: |
+            nuitka-${{ runner.os }}-
+
       - name: Build onefile binary with Nuitka
         uses: Nuitka/Nuitka-Action@v1.3
         with:
