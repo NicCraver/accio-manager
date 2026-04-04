@@ -639,8 +639,8 @@
 
       <div class="stats">
         <div class="stat">
-          <div class="stat-label">账号总数</div>
-          <div class="stat-value">{{ account_count }}</div>
+          <div class="stat-label">账号总数 / 总额度</div>
+          <div class="stat-value">{{ account_count }}（启用 {{ enabled_account_count }}）/ {% if total_remaining_quota is not none %}{{ total_remaining_quota }}%{% else %}-{% endif %}</div>
         </div>
         <div class="stat">
           <div class="stat-label">回调地址</div>

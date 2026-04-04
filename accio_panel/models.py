@@ -48,6 +48,7 @@ class Account:
     auto_disabled: bool = False
     auto_disabled_reason: str | None = None
     last_quota_check_at: int | None = None
+    last_remaining_quota: int | None = None
     next_quota_check_at: int | None = None
     next_quota_check_reason: str | None = None
     added_at: str = field(default_factory=now_text)
@@ -68,6 +69,7 @@ class Account:
             auto_disabled=bool(data.get("autoDisabled", False)),
             auto_disabled_reason=data.get("autoDisabledReason"),
             last_quota_check_at=normalize_timestamp(data.get("lastQuotaCheckAt")),
+            last_remaining_quota=data.get("lastRemainingQuota"),
             next_quota_check_at=normalize_timestamp(data.get("nextQuotaCheckAt")),
             next_quota_check_reason=data.get("nextQuotaCheckReason"),
             added_at=str(data.get("addedAt") or now_text()),
@@ -88,6 +90,7 @@ class Account:
             "autoDisabled": self.auto_disabled,
             "autoDisabledReason": self.auto_disabled_reason,
             "lastQuotaCheckAt": self.last_quota_check_at,
+            "lastRemainingQuota": self.last_remaining_quota,
             "nextQuotaCheckAt": self.next_quota_check_at,
             "nextQuotaCheckReason": self.next_quota_check_reason,
             "addedAt": self.added_at,

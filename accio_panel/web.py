@@ -888,6 +888,7 @@ def _apply_quota_result(
     should_mark_updated = False
 
     if quota["success"]:
+        account.last_remaining_quota = quota["remaining_value"]
         if (
             panel_settings.auto_disable_on_empty_quota
             and account.manual_enabled
@@ -1115,6 +1116,21 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         requested_page = _parse_page_number(request.query_params.get("page"))
         all_accounts = store.list_accounts()
         account_count = len(all_accounts)
+        enabled_accounts = [
+            a for a in all_accounts
+            if a.manual_enabled and not a.auto_disabled
+        ]
+        enabled_account_count = len(enabled_accounts)
+        enabled_quota_values = [
+            a.last_remaining_quota
+            for a in enabled_accounts
+            if a.last_remaining_quota is not None
+        ]
+        total_remaining_quota = (
+            round(sum(enabled_quota_values) / len(enabled_quota_values))
+            if enabled_quota_values
+            else None
+        )
         total_pages = max(1, ((account_count - 1) // page_size) + 1) if account_count else 1
         current_page = min(requested_page, total_pages)
         page_start = (current_page - 1) * page_size
@@ -1142,6 +1158,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 "page_title": "Accio 多账号管理面板",
                 "accounts": dashboard_items,
                 "account_count": account_count,
+                "enabled_account_count": enabled_account_count,
+                "total_remaining_quota": total_remaining_quota,
                 "callback_url": callback_url,
                 "oauth_url": "/oauth",
                 "upstream_proxy_url": panel_settings.upstream_proxy_url,
