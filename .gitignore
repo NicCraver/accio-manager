@@ -26,3 +26,5 @@ data/*.json
 data/*.jsonl
 !data/*.example.json
 data/accounts/*.json
+docs
+.serena
