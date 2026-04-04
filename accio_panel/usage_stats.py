@@ -43,8 +43,9 @@ class UsageStatsStore:
         self.file_path = file_path
         self.file_path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
+        self._cache: dict[str, Any] | None = None
 
-    def _load_unlocked(self) -> dict[str, Any]:
+    def _load_from_disk(self) -> dict[str, Any]:
         if not self.file_path.exists():
             return _empty_payload()
         try:
@@ -71,7 +72,14 @@ class UsageStatsStore:
             "updatedAt": str(payload.get("updatedAt") or ""),
         }
 
+    def _load_unlocked(self) -> dict[str, Any]:
+        if self._cache is not None:
+            return self._cache
+        self._cache = self._load_from_disk()
+        return self._cache
+
     def _save_unlocked(self, payload: dict[str, Any]) -> None:
+        self._cache = payload
         self.file_path.write_text(
             json.dumps(payload, ensure_ascii=False, indent=2),
             encoding="utf-8",

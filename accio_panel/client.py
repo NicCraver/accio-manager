@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import secrets
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 from urllib.parse import unquote, urlencode
 
@@ -13,6 +14,7 @@ from .models import Account
 class AccioClient:
     def __init__(self, settings: Settings):
         self.settings = settings
+        self._session = requests.Session()
 
     def get_proxies(self, proxy_url: str | None = None) -> dict[str, str] | None:
         if not proxy_url:
@@ -75,7 +77,7 @@ class AccioClient:
         **kwargs: Any,
     ) -> dict[str, Any]:
         try:
-            response = requests.request(
+            response = self._session.request(
                 method,
                 url,
                 timeout=self.settings.request_timeout,
@@ -242,9 +244,13 @@ class AccioClient:
         *,
         proxy_url: str | None = None,
     ) -> dict[str, Any]:
-        userinfo = self.query_userinfo(account, proxy_url=proxy_url)
-        invitation = self.query_invitation(account, proxy_url=proxy_url)
-        channel = self.query_channel(account, proxy_url=proxy_url)
+        with ThreadPoolExecutor(max_workers=3) as executor:
+            f_userinfo = executor.submit(self.query_userinfo, account, proxy_url=proxy_url)
+            f_invitation = executor.submit(self.query_invitation, account, proxy_url=proxy_url)
+            f_channel = executor.submit(self.query_channel, account, proxy_url=proxy_url)
+            userinfo = f_userinfo.result()
+            invitation = f_invitation.result()
+            channel = f_channel.result()
 
         userinfo_success = bool(userinfo.get("success"))
         invitation_success = bool(invitation.get("success"))
@@ -308,7 +314,7 @@ class AccioClient:
         *,
         proxy_url: str | None = None,
     ) -> requests.Response:
-        return requests.post(
+        return self._session.post(
             f"{self.settings.base_url}/api/adk/llm/generateContent",
             json=body,
             headers={

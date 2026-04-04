@@ -694,6 +694,38 @@ def _check_proxy_candidate(
     )
 
 
+def _cached_quota_view(account: Account) -> dict[str, Any]:
+    remaining = account.last_remaining_quota
+    if remaining is not None and remaining > 0:
+        level = "low"
+        if remaining < 20:
+            level = "high"
+        elif remaining < 50:
+            level = "medium"
+        return {
+            "success": True,
+            "used_value": 100 - remaining,
+            "used_text": f"{100 - remaining}%",
+            "remaining_value": remaining,
+            "remaining_ratio": remaining,
+            "remaining_text": f"{remaining}%",
+            "reset_text": "-",
+            "level": level,
+            "message": "",
+        }
+    return {
+        "success": remaining is not None,
+        "used_value": 0,
+        "used_text": "-",
+        "remaining_value": 0,
+        "remaining_ratio": 0,
+        "remaining_text": "缓存不可用",
+        "reset_text": "-",
+        "level": "error",
+        "message": "",
+    }
+
+
 def _select_proxy_account(
     application: FastAPI,
     panel_settings: PanelSettings,
@@ -702,7 +734,6 @@ def _select_proxy_account(
     provider: str | None = None,
 ) -> tuple[Account, dict[str, Any]]:
     store: AccountStore = application.state.store
-    client: AccioClient = application.state.client
 
     candidates = _ordered_proxy_candidates(
         store,
@@ -719,90 +750,52 @@ def _select_proxy_account(
 
     errors: list[str] = []
     strategy = panel_settings.api_account_strategy
+
     if strategy == "round_robin":
         start_index = application.state.proxy_round_robin_index % len(candidates)
-        index_order = [
-            (start_index + offset) % len(candidates)
-            for offset in range(len(candidates))
-        ]
-    else:
-        results: list[tuple[Account, dict[str, Any]]] = []
-        workers = min(8, len(candidates))
-        with ThreadPoolExecutor(max_workers=workers) as executor:
-            future_map = {
-                executor.submit(
-                    _check_proxy_candidate,
-                    store,
-                    client,
-                    panel_settings,
-                    candidate,
-                ): candidate.id
-                for candidate in candidates
-            }
-            for future in as_completed(future_map):
-                try:
-                    results.append(future.result())
-                except Exception as exc:  # pragma: no cover
-                    errors.append(str(exc))
-
-        available = [
-            (account, quota)
-            for account, quota in results
-            if not account.auto_disabled
-            and quota["success"]
-            and quota["remaining_value"] > 0
-        ]
-        if available:
-            available.sort(key=lambda item: _proxy_fill_sort_key(item[0], item[1]))
-            return available[0]
-
-        sorted_results = sorted(
-            results,
-            key=lambda item: (item[0].fill_priority, item[0].name, item[0].id),
-        )
-        for account, quota in sorted_results:
+        for offset in range(len(candidates)):
+            index = (start_index + offset) % len(candidates)
+            account = candidates[index]
             if account.auto_disabled:
                 errors.append(
                     f"{account.name}: {account.auto_disabled_reason or '账号已自动禁用。'}"
                 )
                 continue
-            if not quota["success"]:
-                errors.append(f"{account.name}: {quota['message'] or '额度查询失败'}")
-                continue
-            if quota["remaining_value"] <= 0:
+            remaining = account.last_remaining_quota
+            if remaining is not None and remaining <= 0:
                 errors.append(f"{account.name}: 剩余额度为 0%")
                 continue
-
-        raise ProxySelectionError(
-            503,
-            errors[0] if errors else "当前没有可用账号可供 API 调用。",
-        )
-
-    for index in index_order:
-        account, quota = _check_proxy_candidate(
-            store,
-            client,
-            panel_settings,
-            candidates[index],
-        )
-        if account.auto_disabled:
-            errors.append(
-                f"{account.name}: {account.auto_disabled_reason or '账号已自动禁用。'}"
-            )
-            continue
-        if not quota["success"]:
-            errors.append(f"{account.name}: {quota['message'] or '额度查询失败'}")
-            continue
-        if quota["remaining_value"] <= 0:
-            errors.append(f"{account.name}: 剩余额度为 0%")
-            continue
-
-        if strategy == "round_robin":
             application.state.proxy_round_robin_index = (index + 1) % len(candidates)
-        return account, quota
+            return account, _cached_quota_view(account)
 
-    if strategy == "round_robin":
         application.state.proxy_round_robin_index = 0
+    else:
+        available = [
+            a for a in candidates
+            if not a.auto_disabled
+            and (a.last_remaining_quota is None or a.last_remaining_quota > 0)
+        ]
+        if available:
+            available.sort(
+                key=lambda a: (
+                    a.fill_priority,
+                    -(a.last_remaining_quota or 0),
+                    a.name,
+                    a.id,
+                )
+            )
+            return available[0], _cached_quota_view(available[0])
+
+        for account in sorted(
+            candidates,
+            key=lambda a: (a.fill_priority, a.name, a.id),
+        ):
+            if account.auto_disabled:
+                errors.append(
+                    f"{account.name}: {account.auto_disabled_reason or '账号已自动禁用。'}"
+                )
+            elif account.last_remaining_quota is not None and account.last_remaining_quota <= 0:
+                errors.append(f"{account.name}: 剩余额度为 0%")
 
     raise ProxySelectionError(
         503,
@@ -1163,14 +1156,20 @@ async def _quota_scheduler_loop(application: FastAPI) -> None:
             if account.next_quota_check_at is None or account.next_quota_check_at <= now_ts:
                 due_accounts.append(account)
 
-        for account in due_accounts:
-            await asyncio.to_thread(
-                _query_quota_with_refresh_fallback,
-                store,
-                client,
-                account,
-                panel_settings,
-            )
+        if due_accounts:
+            loop = asyncio.get_event_loop()
+            tasks = [
+                loop.run_in_executor(
+                    None,
+                    _query_quota_with_refresh_fallback,
+                    store,
+                    client,
+                    account,
+                    panel_settings,
+                )
+                for account in due_accounts
+            ]
+            await asyncio.gather(*tasks, return_exceptions=True)
 
         await asyncio.sleep(SCHEDULER_TICK_SECONDS)
 

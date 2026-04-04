@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import threading
+from contextlib import contextmanager
 from typing import Any
 from urllib.parse import parse_qs, unquote, urlparse
 
@@ -34,6 +35,8 @@ class MySQLGateway:
         self.password = password
         self.database = database
         self.charset = charset or "utf8mb4"
+        self._conn = None
+        self._conn_lock = threading.Lock()
 
     @classmethod
     def from_settings(cls, settings: Settings) -> "MySQLGateway":
@@ -41,7 +44,7 @@ class MySQLGateway:
             raise ValueError("未配置 ACCIO_MYSQL")
         return cls(**_parse_database_url(settings.database_url))
 
-    def _connect(self):
+    def _new_connection(self):
         try:
             import pymysql
         except ImportError as exc:
@@ -60,9 +63,44 @@ class MySQLGateway:
             cursorclass=pymysql.cursors.DictCursor,
         )
 
-    def ensure_schema(self) -> None:
-        connection = self._connect()
+    def _get_conn(self):
+        with self._conn_lock:
+            conn = self._conn
+            if conn is None:
+                conn = self._new_connection()
+                self._conn = conn
+            else:
+                try:
+                    conn.ping(reconnect=True)
+                except Exception:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+                    conn = self._new_connection()
+                    self._conn = conn
+            return conn
+
+    def _discard_conn(self, conn):
+        with self._conn_lock:
+            if self._conn is conn:
+                self._conn = None
         try:
+            conn.close()
+        except Exception:
+            pass
+
+    @contextmanager
+    def _connect(self):
+        conn = self._get_conn()
+        try:
+            yield conn
+        except Exception:
+            self._discard_conn(conn)
+            raise
+
+    def ensure_schema(self) -> None:
+        with self._connect() as connection:
             with connection.cursor() as cursor:
                 cursor.execute(
                     """
@@ -101,12 +139,9 @@ class MySQLGateway:
                     ) DEFAULT CHARSET=utf8mb4
                     """
                 )
-        finally:
-            connection.close()
 
     def fetch_panel_settings(self) -> dict[str, object] | None:
-        connection = self._connect()
-        try:
+        with self._connect() as connection:
             with connection.cursor() as cursor:
                 cursor.execute(
                     """
@@ -122,8 +157,6 @@ class MySQLGateway:
                     """
                 )
                 row = cursor.fetchone()
-        finally:
-            connection.close()
 
         if not row:
             return None
@@ -142,8 +175,7 @@ class MySQLGateway:
         }
 
     def save_panel_settings(self, payload: dict[str, object]) -> None:
-        connection = self._connect()
-        try:
+        with self._connect() as connection:
             with connection.cursor() as cursor:
                 cursor.execute(
                     """
@@ -173,22 +205,16 @@ class MySQLGateway:
                         str(payload.get("sessionSecret") or ""),
                     ),
                 )
-        finally:
-            connection.close()
 
     def count_accounts(self) -> int:
-        connection = self._connect()
-        try:
+        with self._connect() as connection:
             with connection.cursor() as cursor:
                 cursor.execute("SELECT COUNT(*) AS total FROM accio_accounts")
                 row = cursor.fetchone() or {}
-        finally:
-            connection.close()
         return int(row.get("total") or 0)
 
     def list_accounts(self) -> list[dict[str, object]]:
-        connection = self._connect()
-        try:
+        with self._connect() as connection:
             with connection.cursor() as cursor:
                 cursor.execute(
                     """
@@ -214,14 +240,11 @@ class MySQLGateway:
                     """
                 )
                 rows = cursor.fetchall() or []
-        finally:
-            connection.close()
 
         return [_account_row_to_payload(row) for row in rows]
 
     def upsert_account(self, payload: dict[str, object]) -> None:
-        connection = self._connect()
-        try:
+        with self._connect() as connection:
             with connection.cursor() as cursor:
                 cursor.execute(
                     """
@@ -279,19 +302,14 @@ class MySQLGateway:
                         str(payload.get("updatedAt") or ""),
                     ),
                 )
-        finally:
-            connection.close()
 
     def delete_account(self, account_id: str) -> bool:
-        connection = self._connect()
-        try:
+        with self._connect() as connection:
             with connection.cursor() as cursor:
                 deleted_count = cursor.execute(
                     "DELETE FROM accio_accounts WHERE id = %s",
                     (account_id,),
                 )
-        finally:
-            connection.close()
         return deleted_count > 0
 
 
