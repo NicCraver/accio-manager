@@ -758,6 +758,14 @@
           <div class="summary-value">{{ usage_stats.totals.outputTokens }}</div>
         </div>
         <div class="summary-card">
+          <div class="summary-label">缓存写入 Tokens</div>
+          <div class="summary-value">{{ usage_stats.totals.cacheCreationInputTokens }}</div>
+        </div>
+        <div class="summary-card">
+          <div class="summary-label">缓存命中 Tokens</div>
+          <div class="summary-value">{{ usage_stats.totals.cacheReadInputTokens }}</div>
+        </div>
+        <div class="summary-card">
           <div class="summary-label">最近更新</div>
           <div class="summary-value" style="font-size:16px;">{{ usage_stats.updatedAt }}</div>
         </div>
@@ -776,6 +784,8 @@
                 <th>失败</th>
                 <th>输入 Tokens</th>
                 <th>输出 Tokens</th>
+                <th>缓存写入</th>
+                <th>缓存命中</th>
                 <th>最近调用</th>
               </tr>
             </thead>
@@ -788,6 +798,8 @@
                 <td>{{ item.failedCalls }}</td>
                 <td>{{ item.inputTokens }}</td>
                 <td>{{ item.outputTokens }}</td>
+                <td>{{ item.cacheCreationInputTokens }}</td>
+                <td>{{ item.cacheReadInputTokens }}</td>
                 <td>{{ item.lastUsedAt }}</td>
               </tr>
               {% endfor %}
@@ -812,6 +824,8 @@
                 <th>失败</th>
                 <th>输入 Tokens</th>
                 <th>输出 Tokens</th>
+                <th>缓存写入</th>
+                <th>缓存命中</th>
                 <th>最近调用</th>
               </tr>
             </thead>
@@ -824,6 +838,8 @@
                 <td>{{ item.failedCalls }}</td>
                 <td>{{ item.inputTokens }}</td>
                 <td>{{ item.outputTokens }}</td>
+                <td>{{ item.cacheCreationInputTokens }}</td>
+                <td>{{ item.cacheReadInputTokens }}</td>
                 <td>{{ item.lastUsedAt }}</td>
               </tr>
               {% endfor %}

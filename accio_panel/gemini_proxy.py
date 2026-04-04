@@ -1103,11 +1103,13 @@ def extract_gemini_usage(payload: dict[str, Any]) -> dict[str, int]:
     usage = payload.get("usageMetadata")
     if not isinstance(usage, dict):
         usage = {}
+    candidate_tokens = _as_int(usage.get("candidatesTokenCount"), 0)
+    thought_tokens = _as_int(usage.get("thoughtsTokenCount"), 0)
     return {
         "input_tokens": _as_int(usage.get("promptTokenCount"), 0),
-        "output_tokens": _as_int(usage.get("candidatesTokenCount"), 0),
+        "output_tokens": candidate_tokens + thought_tokens,
         "total_tokens": _as_int(usage.get("totalTokenCount"), 0),
-        "thought_tokens": _as_int(usage.get("thoughtsTokenCount"), 0),
+        "thought_tokens": thought_tokens,
     }
 
 

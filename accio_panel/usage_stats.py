@@ -15,6 +15,8 @@ def _empty_bucket() -> dict[str, Any]:
         "failedCalls": 0,
         "inputTokens": 0,
         "outputTokens": 0,
+        "cacheCreationInputTokens": 0,
+        "cacheReadInputTokens": 0,
         "lastUsedAt": "",
         "lastStopReason": "",
     }
@@ -82,6 +84,8 @@ class UsageStatsStore:
         model: str,
         input_tokens: int,
         output_tokens: int,
+        cache_creation_input_tokens: int = 0,
+        cache_read_input_tokens: int = 0,
         success: bool,
         stop_reason: str | None = None,
     ) -> None:
@@ -105,6 +109,12 @@ class UsageStatsStore:
                 bucket["outputTokens"] = _as_int(bucket.get("outputTokens")) + _as_int(
                     output_tokens
                 )
+                bucket["cacheCreationInputTokens"] = _as_int(
+                    bucket.get("cacheCreationInputTokens")
+                ) + _as_int(cache_creation_input_tokens)
+                bucket["cacheReadInputTokens"] = _as_int(
+                    bucket.get("cacheReadInputTokens")
+                ) + _as_int(cache_read_input_tokens)
                 bucket["lastUsedAt"] = now
                 if stop_reason:
                     bucket["lastStopReason"] = stop_reason
@@ -129,6 +139,8 @@ class UsageStatsStore:
                     "failedCalls": _as_int(bucket.get("failedCalls")),
                     "inputTokens": _as_int(bucket.get("inputTokens")),
                     "outputTokens": _as_int(bucket.get("outputTokens")),
+                    "cacheCreationInputTokens": _as_int(bucket.get("cacheCreationInputTokens")),
+                    "cacheReadInputTokens": _as_int(bucket.get("cacheReadInputTokens")),
                     "lastUsedAt": str(bucket.get("lastUsedAt") or "-"),
                     "lastStopReason": str(bucket.get("lastStopReason") or "-"),
                 }
@@ -149,6 +161,8 @@ class UsageStatsStore:
                     "failedCalls": _as_int(bucket.get("failedCalls")),
                     "inputTokens": _as_int(bucket.get("inputTokens")),
                     "outputTokens": _as_int(bucket.get("outputTokens")),
+                    "cacheCreationInputTokens": _as_int(bucket.get("cacheCreationInputTokens")),
+                    "cacheReadInputTokens": _as_int(bucket.get("cacheReadInputTokens")),
                     "lastUsedAt": str(bucket.get("lastUsedAt") or "-"),
                     "lastStopReason": str(bucket.get("lastStopReason") or "-"),
                 }
@@ -165,6 +179,8 @@ class UsageStatsStore:
                 "failedCalls": _as_int(totals.get("failedCalls")),
                 "inputTokens": _as_int(totals.get("inputTokens")),
                 "outputTokens": _as_int(totals.get("outputTokens")),
+                "cacheCreationInputTokens": _as_int(totals.get("cacheCreationInputTokens")),
+                "cacheReadInputTokens": _as_int(totals.get("cacheReadInputTokens")),
                 "lastUsedAt": str(totals.get("lastUsedAt") or "-"),
                 "lastStopReason": str(totals.get("lastStopReason") or "-"),
             },

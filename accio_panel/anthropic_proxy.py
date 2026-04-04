@@ -36,6 +36,8 @@ def _usage_summary() -> dict[str, int]:
     return {
         "input_tokens": 0,
         "output_tokens": 0,
+        "cache_creation_input_tokens": 0,
+        "cache_read_input_tokens": 0,
     }
 
 
@@ -463,6 +465,14 @@ def update_usage_summary(
                     summary["usage"]["output_tokens"],
                     _as_usage_int(usage.get("output_tokens")),
                 )
+                summary["usage"]["cache_creation_input_tokens"] = max(
+                    summary["usage"]["cache_creation_input_tokens"],
+                    _as_usage_int(usage.get("cache_creation_input_tokens")),
+                )
+                summary["usage"]["cache_read_input_tokens"] = max(
+                    summary["usage"]["cache_read_input_tokens"],
+                    _as_usage_int(usage.get("cache_read_input_tokens")),
+                )
         return
 
     if event_name == "content_block_start":
@@ -505,6 +515,14 @@ def update_usage_summary(
         summary["usage"]["output_tokens"] = max(
             summary["usage"]["output_tokens"],
             _as_usage_int(usage.get("output_tokens")),
+        )
+        summary["usage"]["cache_creation_input_tokens"] = max(
+            summary["usage"]["cache_creation_input_tokens"],
+            _as_usage_int(usage.get("cache_creation_input_tokens")),
+        )
+        summary["usage"]["cache_read_input_tokens"] = max(
+            summary["usage"]["cache_read_input_tokens"],
+            _as_usage_int(usage.get("cache_read_input_tokens")),
         )
 
     delta = event_payload.get("delta")
