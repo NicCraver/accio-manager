@@ -76,7 +76,7 @@ from .openai_proxy import (
 from .persistence import create_runtime_stores
 from .store import AccountStore
 from .usage_stats import UsageStatsStore
-from .utils import format_timestamp, mask_token
+from .utils import format_countdown_hours, format_timestamp, mask_token
 
 
 TEMPLATES = Jinja2Templates(directory=str(Path(__file__).parent / "templates"))
@@ -941,7 +941,13 @@ def _build_quota_view(result: dict[str, Any]) -> dict[str, Any]:
         if total_value > 0
         else 0
     )
-    next_billing_text = str(entitlement.get("nextBillingDate") or "").strip()
+    used_ratio = 100 - remaining_ratio
+
+    next_billing_ts = _parse_billing_timestamp(entitlement.get("nextBillingDate"))
+    if next_billing_ts is not None:
+        reset_text = format_countdown_hours(next_billing_ts - int(time.time()))
+    else:
+        reset_text = "-"
 
     if result.get("success"):
         level = "low"
@@ -951,28 +957,18 @@ def _build_quota_view(result: dict[str, Any]) -> dict[str, Any]:
             level = "medium"
         return {
             "success": True,
-            "total_value": total_value,
-            "used_value": used_value,
-            "used_text": (
-                f"{used_value}/{total_value}"
-                if total_value > 0
-                else str(used_value)
-            ),
-            "remaining_value": remaining_value,
+            "used_value": used_ratio,
+            "used_text": f"{used_ratio}%",
+            "remaining_value": remaining_ratio,
             "remaining_ratio": remaining_ratio,
-            "remaining_text": (
-                f"{remaining_value}/{total_value}"
-                if total_value > 0
-                else str(remaining_value)
-            ),
-            "reset_text": next_billing_text or "-",
+            "remaining_text": f"{remaining_ratio}%",
+            "reset_text": reset_text,
             "level": level,
             "message": _normalize_success_message(result.get("message")),
         }
 
     return {
         "success": False,
-        "total_value": 0,
         "used_value": 0,
         "used_text": "-",
         "remaining_value": 0,
