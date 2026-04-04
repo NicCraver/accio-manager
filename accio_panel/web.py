@@ -3044,6 +3044,48 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             }
         )
 
+    @application.post("/api/accounts/{account_id}/reactivate")
+    def reactivate_account(request: Request, account_id: str) -> JSONResponse:
+        if not _is_admin_authenticated(request):
+            return _unauthorized_json()
+
+        account = store.get_account(account_id)
+        if not account:
+            return JSONResponse(
+                {"success": False, "message": "账号不存在"},
+                status_code=404,
+            )
+
+        if not account.access_token or not account.refresh_token:
+            return JSONResponse(
+                {"success": False, "message": "账号缺少 Token 信息，无法重新激活"},
+                status_code=400,
+            )
+
+        try:
+            panel_settings = panel_settings_store.load()
+            updated, quota, _created, activation = _import_callback_account(
+                store,
+                client,
+                panel_settings,
+                access_token=account.access_token,
+                refresh_token=account.refresh_token,
+                expires_at=account.expires_at,
+                cookie=account.cookie,
+            )
+            activation_text = _activation_summary_text(activation)
+            return JSONResponse(
+                {
+                    "success": True,
+                    "message": f"{updated.name} 重新激活完成，{activation_text}",
+                }
+            )
+        except Exception as exc:
+            return JSONResponse(
+                {"success": False, "message": f"重新激活失败：{exc}"},
+                status_code=502,
+            )
+
     @application.patch("/api/accounts/{account_id}/enabled")
     def update_account_enabled(
         request: Request,
