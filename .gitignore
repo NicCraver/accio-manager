@@ -28,3 +28,4 @@ data/*.jsonl
 data/accounts/*.json
 docs
 .serena
+.claude
