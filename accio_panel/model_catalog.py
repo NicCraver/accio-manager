@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from .gemini_proxy import normalize_gemini_model_name
+
 
 def _as_int(value: Any, default: int = 0) -> int:
     try:
@@ -12,13 +14,6 @@ def _as_int(value: Any, default: int = 0) -> int:
 
 def normalize_model_name(value: Any) -> str:
     return str(value or "").strip()
-
-
-def normalize_gemini_model_name(value: Any) -> str:
-    normalized = normalize_model_name(value)
-    if normalized.lower().startswith("models/"):
-        return normalized[7:].strip()
-    return normalized
 
 
 def is_image_generation_model(model_name: Any) -> bool:

@@ -23,14 +23,3 @@ def format_timestamp(timestamp: int | None) -> str:
     return datetime.fromtimestamp(timestamp).strftime("%Y-%m-%d %H:%M:%S")
 
 
-def format_countdown_hours(seconds: int | float | None) -> str:
-    if seconds in (None, "", 0):
-        return "-"
-    try:
-        total = float(seconds)
-    except (TypeError, ValueError):
-        return "-"
-    if total <= 0:
-        return "即将重置"
-    hours = round(total / 3600, 1)
-    return f"{hours} 小时后"
