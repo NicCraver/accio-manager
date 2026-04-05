@@ -3563,7 +3563,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             )
 
         model = str(payload.get("model") or DEFAULT_ANTHROPIC_MODEL)
-        requested_stream = payload.get("stream", True) is not False
+        requested_stream = bool(payload.get("stream", False))
         messages_value = payload.get("messages")
         messages_count = len(messages_value) if isinstance(messages_value, list) else 0
         try:

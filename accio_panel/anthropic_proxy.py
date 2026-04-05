@@ -738,7 +738,7 @@ def iter_anthropic_sse_events(
             "index": active_block_index,
         }
 
-    if started and not got_message_stop and not strict_wrapped_events:
+    if started and not got_message_stop:
         yield "message_stop", {"type": "message_stop"}
 
 
