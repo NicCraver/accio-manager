@@ -85,6 +85,7 @@ TEMPLATES = Jinja2Templates(directory=str(Path(__file__).parent / "templates"))
 ENABLED_ACCOUNT_CHECK_INTERVAL_SECONDS = 15 * 60
 FAILED_ACCOUNT_RETRY_SECONDS = 5 * 60
 RECOVERY_CHECK_BUFFER_SECONDS = 90
+ABNORMAL_ACCOUNT_RECOVERY_INTERVAL_SECONDS = 30 * 60
 SCHEDULER_TICK_SECONDS = 30
 MODEL_CATALOG_CACHE_SECONDS = 60
 PAGE_SIZE_OPTIONS = (10, 20, 50)
@@ -621,14 +622,14 @@ def _disable_account_after_refresh_failure(
         account.auto_disabled = False
         account.auto_disabled_reason = reason
         account.last_quota_check_at = now_ts
-        account.next_quota_check_at = None
-        account.next_quota_check_reason = None
+        account.next_quota_check_at = now_ts + ABNORMAL_ACCOUNT_RECOVERY_INTERVAL_SECONDS
+        account.next_quota_check_reason = "异常禁用后定时恢复检查"
         return account
     updated.auto_disabled = False
     updated.auto_disabled_reason = reason
     updated.last_quota_check_at = now_ts
-    updated.next_quota_check_at = None
-    updated.next_quota_check_reason = None
+    updated.next_quota_check_at = now_ts + ABNORMAL_ACCOUNT_RECOVERY_INTERVAL_SECONDS
+    updated.next_quota_check_reason = "异常禁用后定时恢复检查"
     store.save(updated)
     return updated
 
@@ -680,6 +681,42 @@ def _query_quota_with_refresh_fallback(
             + (f" {retry_message}" if retry_message else "")
         ).strip()
     return account, quota
+
+
+def _try_recover_abnormal_account(
+    store: AccountStore,
+    client: AccioClient,
+    account: Account,
+    panel_settings: PanelSettings,
+) -> tuple[Account, dict[str, Any]]:
+    """尝试恢复异常禁用的账号：先刷新 Token，再查询额度。"""
+    now_ts = _now_timestamp()
+
+    refresh_result = _refresh_token(client, account, panel_settings)
+    if not refresh_result.get("success"):
+        account.last_quota_check_at = now_ts
+        account.next_quota_check_at = now_ts + ABNORMAL_ACCOUNT_RECOVERY_INTERVAL_SECONDS
+        account.next_quota_check_reason = "异常禁用恢复检查失败，等待下次重试"
+        store.save(account)
+        return account, {"success": False, "message": "Token 刷新仍然失败"}
+
+    refreshed_data = refresh_result.get("data") or {}
+    updated_account = store.update_tokens(
+        account.id,
+        access_token=str(refreshed_data.get("accessToken") or account.access_token),
+        refresh_token=str(refreshed_data.get("refreshToken") or account.refresh_token),
+        expires_at=refreshed_data.get("expiresAt"),
+    )
+    if updated_account:
+        account = updated_account
+
+    account.manual_enabled = True
+    account.auto_disabled = False
+    account.auto_disabled_reason = None
+    store.save(account)
+
+    quota_result = _query_quota(client, account, panel_settings)
+    return _apply_quota_result(store, account, quota_result, panel_settings)
 
 
 def _check_proxy_candidate(
@@ -1254,11 +1291,23 @@ async def _quota_scheduler_loop(application: FastAPI) -> None:
         accounts = store.list_accounts()
 
         due_accounts: list[Account] = []
+        abnormal_recovery_accounts: list[Account] = []
+
         for account in accounts:
             if not account.manual_enabled:
+                # 异常禁用的账号：有 reason 且有调度时间，到期后尝试恢复
                 if (
-                    account.next_quota_check_at is not None
-                    or account.next_quota_check_reason is not None
+                    account.auto_disabled_reason
+                    and account.next_quota_check_at is not None
+                    and account.next_quota_check_at <= now_ts
+                ):
+                    abnormal_recovery_accounts.append(account)
+                elif (
+                    not account.auto_disabled_reason
+                    and (
+                        account.next_quota_check_at is not None
+                        or account.next_quota_check_reason is not None
+                    )
                 ):
                     account.next_quota_check_at = None
                     account.next_quota_check_reason = None
@@ -1282,6 +1331,15 @@ async def _quota_scheduler_loop(application: FastAPI) -> None:
                 for account in due_accounts
             ]
             await asyncio.gather(*tasks, return_exceptions=True)
+
+        for account in abnormal_recovery_accounts:
+            await asyncio.to_thread(
+                _try_recover_abnormal_account,
+                store,
+                client,
+                account,
+                panel_settings,
+            )
 
         await asyncio.sleep(SCHEDULER_TICK_SECONDS)
 
