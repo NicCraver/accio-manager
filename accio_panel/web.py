@@ -4262,6 +4262,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 {"success": False, "message": "账号更新失败"},
                 status_code=500,
             )
+        if not updated.manual_enabled and updated.auto_disabled_reason:
+            updated.manual_enabled = True
+            updated.auto_disabled = False
+            updated.auto_disabled_reason = None
         updated.next_quota_check_at = _now_timestamp()
         updated.next_quota_check_reason = "Token 刷新后立即检查额度"
         store.save(updated)
@@ -4461,6 +4465,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 expires_at=data.get("expiresAt"),
             )
             if updated:
+                if not updated.manual_enabled and updated.auto_disabled_reason:
+                    updated.manual_enabled = True
+                    updated.auto_disabled = False
+                    updated.auto_disabled_reason = None
                 updated.next_quota_check_at = _now_timestamp()
                 updated.next_quota_check_reason = "批量刷新 Token 后立即检查额度"
                 store.save(updated)
@@ -4550,6 +4558,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 if not updated:
                     failures.append(f"{account.name}: 本地保存失败")
                     continue
+                if not updated.manual_enabled and updated.auto_disabled_reason:
+                    updated.manual_enabled = True
+                    updated.auto_disabled = False
+                    updated.auto_disabled_reason = None
                 updated.next_quota_check_at = _now_timestamp()
                 updated.next_quota_check_reason = "批量刷新 Token 后立即检查额度"
                 store.save(updated)
