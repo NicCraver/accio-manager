@@ -291,6 +291,16 @@ def _should_disable_model_on_empty_response(
     return True
 
 
+def _empty_response_log_message(
+    model_name: str,
+    *,
+    disable_model: bool,
+) -> str:
+    if disable_model:
+        return f"空回复，已禁用模型 {model_name}"
+    return "空回复"
+
+
 def _query_llm_config_with_refresh_fallback(
     store: AccountStore,
     client: AccioClient,
@@ -584,12 +594,15 @@ def _ordered_proxy_candidates(
     model_name: str | None = None,
     *,
     provider: str | None = None,
+    exclude_account_ids: set[str] | None = None,
 ) -> list[Account]:
+    excluded_ids = exclude_account_ids or set()
     return [
         account
         for account in store.list_accounts()
         if account.manual_enabled
         and not account.auto_disabled
+        and account.id not in excluded_ids
         and not _account_model_disabled_reason(
             account,
             model_name,
@@ -781,6 +794,7 @@ def _select_proxy_account(
     model_name: str | None = None,
     *,
     provider: str | None = None,
+    exclude_account_ids: set[str] | None = None,
 ) -> tuple[Account, dict[str, Any]]:
     store: AccountStore = application.state.store
 
@@ -788,6 +802,7 @@ def _select_proxy_account(
         store,
         model_name,
         provider=provider,
+        exclude_account_ids=exclude_account_ids,
     )
     if not candidates:
         if model_name:
@@ -1753,7 +1768,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                             "strategy": panel_settings.api_account_strategy,
                             "requestId": selected_request_id,
                             "message": (
-                                f"空回复，已禁用模型 {normalized_model_name}"
+                                _empty_response_log_message(
+                                    normalized_model_name,
+                                    disable_model=True,
+                                )
                                 if empty_response
                                 else "Gemini 流式兼容调用完成"
                             ),
@@ -1803,6 +1821,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                         panel_settings,
                         normalized_model_name,
                         provider="gemini",
+                        exclude_account_ids={stream_account.id},
                     )
                 except ProxySelectionError as exc:
                     return _gemini_error_response(
@@ -1930,7 +1949,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     "stream": False,
                     "strategy": panel_settings.api_account_strategy,
                     "requestId": request_id,
-                    "message": f"空回复，已禁用模型 {normalized_model_name}",
+                    "message": _empty_response_log_message(
+                        normalized_model_name,
+                        disable_model=True,
+                    ),
                     "statusCode": 200,
                     "stopReason": finish_reason,
                     "inputTokens": int(usage["input_tokens"]),
@@ -1951,6 +1973,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     panel_settings,
                     normalized_model_name,
                     provider="gemini",
+                    exclude_account_ids={account.id},
                 )
             except ProxySelectionError as exc:
                 return _gemini_error_response(
@@ -2038,7 +2061,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 "strategy": panel_settings.api_account_strategy,
                 "requestId": request_id,
                 "message": (
-                    f"空回复，已禁用模型 {normalized_model_name}"
+                    _empty_response_log_message(
+                        normalized_model_name,
+                        disable_model=True,
+                    )
                     if output_summary["empty_response"]
                     else "Gemini 兼容调用完成"
                 ),
@@ -2766,7 +2792,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                             "strategy": panel_settings.api_account_strategy,
                             "requestId": selected_request_id,
                             "message": (
-                                f"空回复，已禁用模型 {model}"
+                                _empty_response_log_message(
+                                    model,
+                                    disable_model=disable_on_empty_response,
+                                )
                                 if empty_response
                                 else "Responses 流式调用完成"
                             ),
@@ -2821,6 +2850,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                         application,
                         panel_settings,
                         model,
+                        exclude_account_ids={stream_account.id},
                     )
                 except ProxySelectionError as exc:
                     return _openai_error_response(
@@ -2889,12 +2919,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         if not isinstance(usage, dict):
             usage = {}
         output_summary = _summarize_non_stream_payload(response_payload)
-        if output_summary["empty_response"] and disable_on_empty_response:
-            _disable_account_model_on_empty_response(
-                store,
-                account,
-                model,
-            )
+        if output_summary["empty_response"]:
+            if disable_on_empty_response:
+                _disable_account_model_on_empty_response(
+                    store,
+                    account,
+                    model,
+                )
             usage_stats_store.record_message(
                 account_id=account.id,
                 model=model,
@@ -2916,7 +2947,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     "stream": False,
                     "strategy": panel_settings.api_account_strategy,
                     "requestId": request_id,
-                    "message": f"空回复，已禁用模型 {model}",
+                    "message": _empty_response_log_message(
+                        model,
+                        disable_model=disable_on_empty_response,
+                    ),
                     "statusCode": 200,
                     "stopReason": str(response_payload.get("stop_reason") or "end_turn"),
                     "inputTokens": int(usage.get("input_tokens") or 0),
@@ -2936,6 +2970,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     application,
                     panel_settings,
                     model,
+                    exclude_account_ids={account.id},
                 )
             except ProxySelectionError as exc:
                 return _openai_error_response(
@@ -2995,7 +3030,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             if not isinstance(usage, dict):
                 usage = {}
             output_summary = _summarize_non_stream_payload(response_payload)
-            if output_summary["empty_response"]:
+            if output_summary["empty_response"] and disable_on_empty_response:
                 _disable_account_model_on_empty_response(
                     store,
                     account,
@@ -3044,7 +3079,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 "strategy": panel_settings.api_account_strategy,
                 "requestId": request_id,
                 "message": (
-                    f"空回复，已禁用模型 {model}"
+                    _empty_response_log_message(
+                        model,
+                        disable_model=disable_on_empty_response,
+                    )
                     if output_summary["empty_response"]
                     else "Responses 非流式调用完成"
                 ),
@@ -3316,7 +3354,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                             "strategy": panel_settings.api_account_strategy,
                             "requestId": selected_request_id,
                             "message": (
-                                f"空回复，已禁用模型 {model}"
+                                _empty_response_log_message(
+                                    model,
+                                    disable_model=disable_on_empty_response,
+                                )
                                 if empty_response
                                 else "OpenAI 流式调用完成"
                             ),
@@ -3366,6 +3407,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                         application,
                         panel_settings,
                         model,
+                        exclude_account_ids={stream_account.id},
                     )
                 except ProxySelectionError as exc:
                     return _openai_error_response(
@@ -3434,12 +3476,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         if not isinstance(usage, dict):
             usage = {}
         output_summary = _summarize_non_stream_payload(response_payload)
-        if output_summary["empty_response"] and disable_on_empty_response:
-            _disable_account_model_on_empty_response(
-                store,
-                account,
-                model,
-            )
+        if output_summary["empty_response"]:
+            if disable_on_empty_response:
+                _disable_account_model_on_empty_response(
+                    store,
+                    account,
+                    model,
+                )
             usage_stats_store.record_message(
                 account_id=account.id,
                 model=model,
@@ -3461,7 +3504,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     "stream": False,
                     "strategy": panel_settings.api_account_strategy,
                     "requestId": request_id,
-                    "message": f"空回复，已禁用模型 {model}",
+                    "message": _empty_response_log_message(
+                        model,
+                        disable_model=disable_on_empty_response,
+                    ),
                     "statusCode": 200,
                     "stopReason": str(response_payload.get("stop_reason") or "end_turn"),
                     "inputTokens": int(usage.get("input_tokens") or 0),
@@ -3481,6 +3527,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     application,
                     panel_settings,
                     model,
+                    exclude_account_ids={account.id},
                 )
             except ProxySelectionError as exc:
                 return _openai_error_response(
@@ -3540,7 +3587,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             if not isinstance(usage, dict):
                 usage = {}
             output_summary = _summarize_non_stream_payload(response_payload)
-            if output_summary["empty_response"]:
+            if output_summary["empty_response"] and disable_on_empty_response:
                 _disable_account_model_on_empty_response(
                     store,
                     account,
@@ -3591,7 +3638,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 "strategy": panel_settings.api_account_strategy,
                 "requestId": request_id,
                 "message": (
-                    f"空回复，已禁用模型 {model}"
+                    _empty_response_log_message(
+                        model,
+                        disable_model=disable_on_empty_response,
+                    )
                     if output_summary["empty_response"]
                     else "OpenAI 非流式调用完成"
                 ),
@@ -3860,7 +3910,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                             "strategy": panel_settings.api_account_strategy,
                             "requestId": selected_request_id,
                             "message": (
-                                f"空回复，已禁用模型 {model}"
+                                _empty_response_log_message(
+                                    model,
+                                    disable_model=disable_on_empty_response,
+                                )
                                 if empty_response
                                 else "流式调用完成"
                             ),
@@ -3912,6 +3965,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                         application,
                         panel_settings,
                         model,
+                        exclude_account_ids={stream_account.id},
                     )
                 except ProxySelectionError as exc:
                     return _anthropic_error_response(exc.status_code, exc.message)
@@ -3967,12 +4021,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         if not isinstance(usage, dict):
             usage = {}
         output_summary = _summarize_non_stream_payload(response_payload)
-        if output_summary["empty_response"] and disable_on_empty_response:
-            _disable_account_model_on_empty_response(
-                store,
-                account,
-                model,
-            )
+        if output_summary["empty_response"]:
+            if disable_on_empty_response:
+                _disable_account_model_on_empty_response(
+                    store,
+                    account,
+                    model,
+                )
             usage_stats_store.record_message(
                 account_id=account.id,
                 model=model,
@@ -3996,7 +4051,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     "stream": False,
                     "strategy": panel_settings.api_account_strategy,
                     "requestId": request_id,
-                    "message": f"空回复，已禁用模型 {model}",
+                    "message": _empty_response_log_message(
+                        model,
+                        disable_model=disable_on_empty_response,
+                    ),
                     "statusCode": 200,
                     "stopReason": str(response_payload.get("stop_reason") or "end_turn"),
                     "inputTokens": int(usage.get("input_tokens") or 0),
@@ -4018,6 +4076,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     application,
                     panel_settings,
                     model,
+                    exclude_account_ids={account.id},
                 )
             except ProxySelectionError as exc:
                 return _anthropic_error_response(exc.status_code, exc.message)
@@ -4065,7 +4124,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             if not isinstance(usage, dict):
                 usage = {}
             output_summary = _summarize_non_stream_payload(response_payload)
-            if output_summary["empty_response"]:
+            if output_summary["empty_response"] and disable_on_empty_response:
                 _disable_account_model_on_empty_response(
                     store,
                     account,
@@ -4104,7 +4163,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 "strategy": panel_settings.api_account_strategy,
                 "requestId": request_id,
                 "message": (
-                    f"空回复，已禁用模型 {model}"
+                    _empty_response_log_message(
+                        model,
+                        disable_model=disable_on_empty_response,
+                    )
                     if output_summary["empty_response"]
                     else "非流式调用完成"
                 ),

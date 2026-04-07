@@ -13,7 +13,7 @@ from accio_panel.config import Settings
 from accio_panel.models import Account
 from accio_panel.mysql_storage import MySQLGateway
 from accio_panel.store import AccountStore
-from accio_panel.web import _ordered_proxy_candidates, create_app
+from accio_panel.web import _ordered_proxy_candidates, _select_proxy_account, create_app
 
 
 class _FakeSSEUpstreamResponse:
@@ -227,6 +227,56 @@ async def _invoke_openai_chat_route(
     return response, b"".join(body_chunks).decode("utf-8")
 
 
+async def _invoke_anthropic_messages_route(
+    app,
+    *,
+    headers: dict[str, str],
+    payload: dict[str, object],
+):
+    route = next(
+        route
+        for route in app.router.routes
+        if getattr(route, "path", "") == "/v1/messages"
+        and "POST" in getattr(route, "methods", set())
+    )
+    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    received = False
+
+    async def receive():
+        nonlocal received
+        if received:
+            return {"type": "http.request", "body": b"", "more_body": False}
+        received = True
+        return {"type": "http.request", "body": body, "more_body": False}
+
+    scope = {
+        "type": "http",
+        "http_version": "1.1",
+        "method": "POST",
+        "path": "/v1/messages",
+        "raw_path": b"/v1/messages",
+        "headers": [
+            (key.lower().encode("utf-8"), value.encode("utf-8"))
+            for key, value in headers.items()
+        ],
+        "query_string": b"",
+        "scheme": "http",
+        "client": ("127.0.0.1", 12345),
+        "server": ("testserver", 80),
+        "root_path": "",
+        "app": app,
+    }
+    request = Request(scope, receive)
+    response = await route.endpoint(request)
+    body_chunks: list[bytes] = []
+    if hasattr(response, "body_iterator"):
+        async for chunk in response.body_iterator:
+            body_chunks.append(chunk if isinstance(chunk, bytes) else chunk.encode("utf-8"))
+    else:
+        body_chunks.append(response.body)
+    return response, b"".join(body_chunks).decode("utf-8")
+
+
 class ProxyRoutingTests(unittest.TestCase):
     def test_ordered_proxy_candidates_excludes_auto_disabled_and_model_disabled_accounts(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -328,6 +378,53 @@ class ProxyRoutingTests(unittest.TestCase):
             params,
         )
 
+    def test_select_proxy_account_can_exclude_current_account(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings(data_dir=Path(temp_dir), database_url="")
+
+            async def _noop_scheduler(_application):
+                return None
+
+            with patch("accio_panel.web._quota_scheduler_loop", _noop_scheduler):
+                app = create_app(settings)
+
+            panel_settings = PanelSettings(
+                admin_password="admin",
+                session_secret="test-session",
+                api_account_strategy="fill",
+            )
+            app.state.panel_settings_store.save(panel_settings)
+            store = app.state.store
+            store.save(
+                Account(
+                    id="acc-1",
+                    name="账号1",
+                    access_token="token-1",
+                    refresh_token="refresh-1",
+                    utdid="utdid-1",
+                    fill_priority=0,
+                )
+            )
+            store.save(
+                Account(
+                    id="acc-2",
+                    name="账号2",
+                    access_token="token-2",
+                    refresh_token="refresh-2",
+                    utdid="utdid-2",
+                    fill_priority=10,
+                )
+            )
+
+            selected_account, _ = _select_proxy_account(
+                app,
+                panel_settings,
+                "claude-sonnet-4-6",
+                exclude_account_ids={"acc-1"},
+            )
+
+            self.assertEqual(selected_account.id, "acc-2")
+
     def test_openai_stream_retries_once_after_empty_response(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             settings = Settings(data_dir=Path(temp_dir), database_url="")
@@ -388,6 +485,147 @@ class ProxyRoutingTests(unittest.TestCase):
             disabled_account = store.get_account("acc-1")
             self.assertIsNotNone(disabled_account)
             self.assertIn("deepseek-r1", disabled_account.disabled_models)
+
+    def test_openai_stream_claude_retries_with_different_account_after_empty_response(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings(data_dir=Path(temp_dir), database_url="")
+            fake_client = _FakeProxyClient(
+                {
+                    "acc-1": [
+                        _empty_claude_stream(),
+                        _text_claude_stream("同账号重试"),
+                    ],
+                    "acc-2": [_text_claude_stream("第二个账号命中")],
+                }
+            )
+
+            async def _noop_scheduler(_application):
+                return None
+
+            with patch("accio_panel.web.AccioClient", return_value=fake_client):
+                with patch("accio_panel.web._is_allowed_dynamic_model", return_value=(True, [])):
+                    with patch("accio_panel.web._quota_scheduler_loop", _noop_scheduler):
+                        app = create_app(settings)
+
+            app.state.panel_settings_store.save(
+                PanelSettings(
+                    admin_password="admin",
+                    session_secret="test-session",
+                    api_account_strategy="fill",
+                )
+            )
+            store = app.state.store
+            store.save(
+                Account(
+                    id="acc-1",
+                    name="账号1",
+                    access_token="token-1",
+                    refresh_token="refresh-1",
+                    utdid="utdid-1",
+                    fill_priority=0,
+                )
+            )
+            store.save(
+                Account(
+                    id="acc-2",
+                    name="账号2",
+                    access_token="token-2",
+                    refresh_token="refresh-2",
+                    utdid="utdid-2",
+                    fill_priority=10,
+                )
+            )
+
+            response, response_text = asyncio.run(
+                _invoke_openai_chat_route(
+                    app,
+                    headers={"x-api-key": "admin"},
+                    payload={
+                        "model": "claude-sonnet-4-6",
+                        "stream": True,
+                        "messages": [{"role": "user", "content": "hello"}],
+                    },
+                )
+            )
+
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(response.headers["x-accio-account-id"], "acc-2")
+            self.assertIn("第二个账号命中", response_text)
+            self.assertEqual(fake_client.calls, ["acc-1", "acc-2"])
+            disabled_account = store.get_account("acc-1")
+            self.assertIsNotNone(disabled_account)
+            self.assertNotIn("claude-sonnet-4-6", disabled_account.disabled_models)
+
+    def test_anthropic_non_stream_claude_retries_with_different_account_after_empty_response(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings(data_dir=Path(temp_dir), database_url="")
+            fake_client = _FakeProxyClient(
+                {
+                    "acc-1": [
+                        _empty_claude_stream(),
+                        _text_claude_stream("同账号重试"),
+                    ],
+                    "acc-2": [_text_claude_stream("第二个账号命中")],
+                }
+            )
+
+            async def _noop_scheduler(_application):
+                return None
+
+            with patch("accio_panel.web.AccioClient", return_value=fake_client):
+                with patch("accio_panel.web._is_allowed_dynamic_model", return_value=(True, [])):
+                    with patch("accio_panel.web._quota_scheduler_loop", _noop_scheduler):
+                        app = create_app(settings)
+
+            app.state.panel_settings_store.save(
+                PanelSettings(
+                    admin_password="admin",
+                    session_secret="test-session",
+                    api_account_strategy="fill",
+                )
+            )
+            store = app.state.store
+            store.save(
+                Account(
+                    id="acc-1",
+                    name="账号1",
+                    access_token="token-1",
+                    refresh_token="refresh-1",
+                    utdid="utdid-1",
+                    fill_priority=0,
+                )
+            )
+            store.save(
+                Account(
+                    id="acc-2",
+                    name="账号2",
+                    access_token="token-2",
+                    refresh_token="refresh-2",
+                    utdid="utdid-2",
+                    fill_priority=10,
+                )
+            )
+
+            response, response_text = asyncio.run(
+                _invoke_anthropic_messages_route(
+                    app,
+                    headers={"x-api-key": "admin"},
+                    payload={
+                        "model": "claude-sonnet-4-6",
+                        "max_tokens": 256,
+                        "stream": False,
+                        "messages": [{"role": "user", "content": "hello"}],
+                    },
+                )
+            )
+
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(response.headers["x-accio-account-id"], "acc-2")
+            self.assertIn("第二个账号命中", response_text)
+            self.assertEqual(fake_client.calls, ["acc-1", "acc-2"])
+            disabled_account = store.get_account("acc-1")
+            self.assertIsNotNone(disabled_account)
+            self.assertNotIn("claude-sonnet-4-6", disabled_account.disabled_models)
 
 
 if __name__ == "__main__":
