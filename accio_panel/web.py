@@ -487,6 +487,30 @@ def _proxy_fill_sort_key(account: Account, quota: dict[str, Any]) -> tuple[Any, 
     )
 
 
+def _dashboard_account_pre_sort_key(account: Account) -> tuple[Any, ...]:
+    """Pagination: surface accounts that already have cached quota first."""
+    has_known_quota = account.last_remaining_quota is not None
+    return (
+        0 if has_known_quota else 1,
+        account.fill_priority,
+        account.name.lower(),
+        account.id,
+    )
+
+
+def _dashboard_item_sort_key(item: dict[str, Any]) -> tuple[Any, ...]:
+    """Table rows: successful quota fetch first, then same tie-break as proxy fill."""
+    quota = item["quota"]
+    success_rank = 0 if quota.get("success") else 1
+    return (
+        success_rank,
+        item["fill_priority"],
+        quota.get("remaining_value", 0),
+        item["name"].lower(),
+        item["id"],
+    )
+
+
 def _account_status_view(account: Account) -> dict[str, Any]:
     if not account.manual_enabled:
         disabled_reason = str(account.auto_disabled_reason or "").strip()
@@ -694,6 +718,20 @@ def _disable_account_after_refresh_failure(
     return updated
 
 
+def _has_valid_quota_data(result: dict[str, Any]) -> bool:
+    """Check if a quota result contains meaningful quota data."""
+    if not result.get("success"):
+        return False
+    data = result.get("data") if isinstance(result, dict) else None
+    if not isinstance(data, dict):
+        return False
+    entitlement = _extract_subscription_entitlement(data)
+    total = _as_int(data.get("total"), _as_int(entitlement.get("total")))
+    remaining = _as_int(data.get("remaining"), _as_int(entitlement.get("remaining")))
+    used = _as_int(entitlement.get("used"))
+    return total > 0 or remaining > 0 or used > 0
+
+
 def _query_quota_with_refresh_fallback(
     store: AccountStore,
     client: AccioClient,
@@ -703,13 +741,16 @@ def _query_quota_with_refresh_fallback(
     quota_result = _query_quota(client, account, panel_settings)
     if not account.manual_enabled:
         return _apply_quota_result(store, account, quota_result, panel_settings)
-    if quota_result.get("success"):
+    if _has_valid_quota_data(quota_result):
         return _apply_quota_result(store, account, quota_result, panel_settings)
+
+    quota_failed = not quota_result.get("success")
+    fail_label = "额度查询失败" if quota_failed else "获取不到额度数据"
 
     refresh_result = _refresh_token(client, account, panel_settings)
     if not refresh_result.get("success"):
         reason = (
-            "额度查询失败，且 Token 刷新失败："
+            f"{fail_label}，且 Token 刷新失败："
             f"{refresh_result.get('message') or '刷新失败'}。系统已自动禁用该账号，请手动处理。"
         )
         disabled_account = _disable_account_after_refresh_failure(store, account, reason)
@@ -726,21 +767,24 @@ def _query_quota_with_refresh_fallback(
     )
     if updated_account:
         updated_account.next_quota_check_at = _now_timestamp()
-        updated_account.next_quota_check_reason = "额度查询失败后自动刷新 Token 并重试额度"
+        updated_account.next_quota_check_reason = f"{fail_label}后自动刷新 Token 并重试额度"
         store.save(updated_account)
         account = updated_account
 
     retried_quota_result = _query_quota(client, account, panel_settings)
-    account, quota = _apply_quota_result(store, account, retried_quota_result, panel_settings)
-    if quota["success"]:
-        quota["message"] = quota["message"] or "额度查询失败后已自动刷新 Token 并恢复。"
-    else:
-        retry_message = str(quota.get("message") or "").strip()
-        quota["message"] = (
-            "额度查询失败，已自动刷新 Token 并重试，但额度查询仍失败。"
-            + (f" {retry_message}" if retry_message else "")
-        ).strip()
-    return account, quota
+    if _has_valid_quota_data(retried_quota_result):
+        account, quota = _apply_quota_result(store, account, retried_quota_result, panel_settings)
+        quota["message"] = quota["message"] or f"{fail_label}后已自动刷新 Token 并恢复。"
+        return account, quota
+
+    reason = (
+        f"{fail_label}，已自动刷新 Token 并重试，但仍获取不到额度数据。"
+        "系统已自动禁用该账号，请手动处理。"
+    )
+    disabled_account = _disable_account_after_refresh_failure(store, account, reason)
+    failed_quota = _build_quota_view(retried_quota_result)
+    failed_quota["message"] = reason
+    return disabled_account, failed_quota
 
 
 def _try_recover_abnormal_account(
@@ -1211,6 +1255,7 @@ def _build_dashboard_items(
                 "quota": quota_view,
             }
         )
+    items.sort(key=_dashboard_item_sort_key)
     return items
 
 
@@ -1369,7 +1414,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         current_view = _parse_dashboard_view(request.query_params.get("view"))
         page_size = _parse_page_size(request.query_params.get("pageSize"))
         requested_page = _parse_page_number(request.query_params.get("page"))
-        all_accounts = store.list_accounts()
+        all_accounts = sorted(
+            store.list_accounts(),
+            key=_dashboard_account_pre_sort_key,
+        )
         account_count = len(all_accounts)
         enabled_accounts = [
             a for a in all_accounts
