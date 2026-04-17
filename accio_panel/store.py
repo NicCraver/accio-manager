@@ -6,8 +6,12 @@ import uuid
 from pathlib import Path
 from typing import Any
 
+from collections import Counter
+
 from .models import (
     Account,
+    DEFAULT_FILL_PRIORITY,
+    FILL_PRIORITY_GROUP_SIZE,
     normalize_fill_priority,
     normalize_model_key,
     normalize_timestamp,
@@ -79,6 +83,23 @@ class BaseAccountStore:
                 if suffix.isdigit():
                     max_index = max(max_index, int(suffix))
         return f"账号{max_index + 1}"
+
+    def _next_fill_priority(self, accounts: list[Account]) -> int:
+        """按每组 FILL_PRIORITY_GROUP_SIZE 个账号自动分配优先级（从 1 开始）。
+
+        只统计优先级 < DEFAULT_FILL_PRIORITY 的账号（排除历史默认值 100 的老号）。
+        找到最小的、未满组的优先级；若所有组都满则新建下一级。
+        """
+        counts: Counter[int] = Counter()
+        for a in accounts:
+            if a.fill_priority < DEFAULT_FILL_PRIORITY:
+                counts[a.fill_priority] += 1
+        if not counts:
+            return 1
+        for priority in sorted(counts):
+            if counts[priority] < FILL_PRIORITY_GROUP_SIZE:
+                return priority
+        return max(counts) + 1
 
     def _match_existing_account_unlocked(
         self,
@@ -158,6 +179,9 @@ class BaseAccountStore:
                 while not imported.id or imported.id in existing_ids:
                     imported.id = uuid.uuid4().hex
 
+                if imported.fill_priority == DEFAULT_FILL_PRIORITY:
+                    imported.fill_priority = self._next_fill_priority(accounts)
+
                 imported.updated_at = now
                 self._write_account_unlocked(imported)
                 accounts.append(imported)
@@ -216,6 +240,7 @@ class BaseAccountStore:
                 access_token=access_token,
                 refresh_token=refresh_token,
                 utdid=new_utdid(),
+                fill_priority=self._next_fill_priority(accounts),
                 expires_at=normalize_timestamp(expires_at),
                 cookie=cookie,
                 added_at=now,

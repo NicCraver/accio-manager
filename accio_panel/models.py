@@ -6,6 +6,7 @@ from typing import Any
 
 
 DEFAULT_FILL_PRIORITY = 100
+FILL_PRIORITY_GROUP_SIZE = 3
 
 
 def now_text() -> str:
