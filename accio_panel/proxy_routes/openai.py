@@ -25,6 +25,7 @@ from ..openai_proxy import (
 )
 from ..upstream_support import (
     extract_upstream_turn_error_from_chunk as _extract_upstream_turn_error_from_chunk,
+    is_retryable_quota_exhausted_turn_error as _is_retryable_quota_exhausted_turn_error,
     is_stream_summary_empty as _is_stream_summary_empty,
     make_upstream_attempt_logger as _make_upstream_attempt_logger,
     openai_chat_chunk_has_meaningful_output as _openai_chat_chunk_has_meaningful_output,
@@ -56,6 +57,7 @@ def install_openai_routes(context: ProxyRouteContext) -> None:
     _empty_response_log_message = context.empty_response_log_message
     _should_disable_model_on_empty_response = context.should_disable_model_on_empty_response
     _disable_account_model_on_empty_response = context.disable_account_model_on_empty_response
+    _mark_account_quota_exhausted_cooldown = context.mark_account_quota_exhausted_cooldown
     _openai_error_response = context.openai_error_response
 
     @application.post("/v1/responses")
@@ -453,6 +455,8 @@ def install_openai_routes(context: ProxyRouteContext) -> None:
                         error_type="server_error",
                         code="upstream_error",
                     )
+                if _is_retryable_quota_exhausted_turn_error(exc):
+                    _mark_account_quota_exhausted_cooldown(store, stream_account)
                 has_meaningful_output = False
             if not has_meaningful_output:
                 try:
@@ -533,6 +537,8 @@ def install_openai_routes(context: ProxyRouteContext) -> None:
                             "retryReason": "upstream_turn_error_or_empty_response",
                         },
                     )
+                    if _is_retryable_quota_exhausted_turn_error(exc):
+                        _mark_account_quota_exhausted_cooldown(store, stream_account)
                     return _openai_error_response(
                         502,
                         _upstream_turn_error_message(exc),
@@ -577,6 +583,8 @@ def install_openai_routes(context: ProxyRouteContext) -> None:
                     error_type="server_error",
                     code="upstream_error",
                 )
+            if _is_retryable_quota_exhausted_turn_error(exc):
+                _mark_account_quota_exhausted_cooldown(store, account)
             should_retry = True
             retry_due_to_upstream_turn_error = True
         else:
@@ -739,6 +747,8 @@ def install_openai_routes(context: ProxyRouteContext) -> None:
                         ),
                     },
                 )
+                if _is_retryable_quota_exhausted_turn_error(exc):
+                    _mark_account_quota_exhausted_cooldown(store, account)
                 return _openai_error_response(
                     502,
                     _upstream_turn_error_message(exc),
@@ -1243,6 +1253,8 @@ def install_openai_routes(context: ProxyRouteContext) -> None:
                         error_type="server_error",
                         code="upstream_error",
                     )
+                if _is_retryable_quota_exhausted_turn_error(exc):
+                    _mark_account_quota_exhausted_cooldown(store, stream_account)
                 has_meaningful_output = False
             if not has_meaningful_output:
                 try:
@@ -1323,6 +1335,8 @@ def install_openai_routes(context: ProxyRouteContext) -> None:
                             "retryReason": "upstream_turn_error_or_empty_response",
                         },
                     )
+                    if _is_retryable_quota_exhausted_turn_error(exc):
+                        _mark_account_quota_exhausted_cooldown(store, stream_account)
                     return _openai_error_response(
                         502,
                         _upstream_turn_error_message(exc),
@@ -1367,6 +1381,8 @@ def install_openai_routes(context: ProxyRouteContext) -> None:
                     error_type="server_error",
                     code="upstream_error",
                 )
+            if _is_retryable_quota_exhausted_turn_error(exc):
+                _mark_account_quota_exhausted_cooldown(store, account)
             should_retry = True
             retry_due_to_upstream_turn_error = True
         else:
@@ -1529,6 +1545,8 @@ def install_openai_routes(context: ProxyRouteContext) -> None:
                         ),
                     },
                 )
+                if _is_retryable_quota_exhausted_turn_error(exc):
+                    _mark_account_quota_exhausted_cooldown(store, account)
                 return _openai_error_response(
                     502,
                     _upstream_turn_error_message(exc),

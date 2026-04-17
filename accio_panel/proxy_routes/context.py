@@ -62,6 +62,9 @@ class ProxyRouteContext:
     def disable_account_model_on_empty_response(self, *args: Any, **kwargs: Any):
         return self.helpers._disable_account_model_on_empty_response(*args, **kwargs)
 
+    def mark_account_quota_exhausted_cooldown(self, *args: Any, **kwargs: Any):
+        return self.helpers._mark_account_quota_exhausted_cooldown(*args, **kwargs)
+
     def extract_proxy_api_key(self, *args: Any, **kwargs: Any):
         return self.helpers._extract_proxy_api_key(*args, **kwargs)
 

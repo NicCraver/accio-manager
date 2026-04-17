@@ -48,13 +48,18 @@ def upstream_turn_error_message(exc: UpstreamTurnError) -> str:
     return f"上游返回错误: {message}"
 
 
+def is_retryable_quota_exhausted_turn_error(exc: UpstreamTurnError) -> bool:
+    error_code = str(exc.error_code or "").strip()
+    if error_code != "429":
+        return False
+    return "quota exhausted" in str(exc.error_message or "").strip().lower()
+
+
 def should_retry_upstream_turn_error(exc: UpstreamTurnError) -> bool:
     error_code = str(exc.error_code or "").strip()
     if error_code == "555":
         return True
-    if error_code != "429":
-        return False
-    return "quota exhausted" in str(exc.error_message or "").strip().lower()
+    return is_retryable_quota_exhausted_turn_error(exc)
 
 
 def _normalize_upstream_error_message(message: str, *, status_code: int) -> str:

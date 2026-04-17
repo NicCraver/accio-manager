@@ -108,6 +108,10 @@ SCHEDULER_TICK_SECONDS = 30
 MODEL_CATALOG_CACHE_SECONDS = 60
 PAGE_SIZE_OPTIONS = (10, 20, 50)
 DEFAULT_PAGE_SIZE = PAGE_SIZE_OPTIONS[0]
+UPSTREAM_QUOTA_EXHAUSTED_AUTO_DISABLED_REASON = (
+    "上游返回 [429]: quota exhausted，系统已暂时跳过该账号并等待自动恢复重试。"
+)
+UPSTREAM_QUOTA_EXHAUSTED_RECOVERY_REASON = "上游 quota exhausted 后自动恢复重试"
 
 
 class ProxySelectionError(Exception):
@@ -694,6 +698,30 @@ def _disable_account_after_refresh_failure(
     return updated
 
 
+def _is_upstream_quota_exhausted_cooldown(account: Account) -> bool:
+    return (
+        account.auto_disabled
+        and str(account.next_quota_check_reason or "").strip()
+        == UPSTREAM_QUOTA_EXHAUSTED_RECOVERY_REASON
+    )
+
+
+def _mark_account_quota_exhausted_cooldown(
+    store: AccountStore,
+    account: Account,
+) -> Account:
+    now_ts = _now_timestamp()
+    updated = store.get_account(account.id) or account
+    updated.auto_disabled = True
+    updated.auto_disabled_reason = UPSTREAM_QUOTA_EXHAUSTED_AUTO_DISABLED_REASON
+    updated.last_quota_check_at = now_ts
+    updated.next_quota_check_at = now_ts + FAILED_ACCOUNT_RETRY_SECONDS
+    updated.next_quota_check_reason = UPSTREAM_QUOTA_EXHAUSTED_RECOVERY_REASON
+    updated.updated_at = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(now_ts))
+    store.save(updated)
+    return updated
+
+
 def _query_quota_with_refresh_fallback(
     store: AccountStore,
     client: AccioClient,
@@ -1079,6 +1107,19 @@ def _plan_next_quota_check(
         return now_ts + FAILED_ACCOUNT_RETRY_SECONDS, "额度查询失败后重试"
 
     if account.auto_disabled:
+        if _is_upstream_quota_exhausted_cooldown(account):
+            if next_billing_at is not None:
+                return (
+                    max(
+                        now_ts + RECOVERY_CHECK_BUFFER_SECONDS,
+                        next_billing_at + RECOVERY_CHECK_BUFFER_SECONDS,
+                    ),
+                    UPSTREAM_QUOTA_EXHAUSTED_RECOVERY_REASON,
+                )
+            return (
+                now_ts + FAILED_ACCOUNT_RETRY_SECONDS,
+                UPSTREAM_QUOTA_EXHAUSTED_RECOVERY_REASON,
+            )
         if not panel_settings.auto_enable_on_recovered_quota:
             return None, None
         if next_billing_at is not None:
@@ -1101,6 +1142,7 @@ def _apply_quota_result(
     next_billing_at = _extract_next_billing_timestamp(quota_result)
     now_ts = _now_timestamp()
     should_mark_updated = False
+    force_auto_recover = _is_upstream_quota_exhausted_cooldown(account)
 
     if quota["success"]:
         account.last_remaining_quota = quota["remaining_value"]
@@ -1115,9 +1157,9 @@ def _apply_quota_result(
             account.auto_disabled_reason = "剩余额度已耗尽，系统已自动禁用。"
             should_mark_updated = True
         elif (
-            panel_settings.auto_enable_on_recovered_quota
-            and account.auto_disabled
+            account.auto_disabled
             and quota["remaining_value"] > 0
+            and (panel_settings.auto_enable_on_recovered_quota or force_auto_recover)
         ):
             account.auto_disabled = False
             account.auto_disabled_reason = None

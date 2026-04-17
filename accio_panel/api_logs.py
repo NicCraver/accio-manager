@@ -138,6 +138,8 @@ class ApiLogStore:
                 continue
 
             image_summary = _extract_image_summary(payload)
+            phase = str(payload.get("phase") or "").strip() or "final"
+            attempt = _as_int(payload.get("attempt"), 0)
             item = {
                 "id": str(payload.get("id") or ""),
                 "createdAt": str(payload.get("createdAt") or "-"),
@@ -155,6 +157,14 @@ class ApiLogStore:
                 "inputTokens": int(payload.get("inputTokens") or 0),
                 "outputTokens": int(payload.get("outputTokens") or 0),
                 "durationMs": int(payload.get("durationMs") or 0),
+                "phase": phase,
+                "phaseLabel": "上游尝试" if phase == "upstream_attempt" else "最终结果",
+                "attempt": attempt,
+                "attemptDisplay": str(attempt) if attempt > 0 else "-",
+                "requestId": str(payload.get("requestId") or ""),
+                "rootRequestId": str(
+                    payload.get("rootRequestId") or payload.get("requestId") or ""
+                ),
                 **image_summary,
                 "detailJson": json.dumps(payload, ensure_ascii=False, indent=2),
             }

@@ -24,6 +24,7 @@ from ..models import Account
 from ..upstream_support import (
     extract_upstream_turn_error_from_chunk as _extract_upstream_turn_error_from_chunk,
     gemini_stream_chunk_has_meaningful_output as _gemini_stream_chunk_has_meaningful_output,
+    is_retryable_quota_exhausted_turn_error as _is_retryable_quota_exhausted_turn_error,
     is_stream_summary_empty as _is_stream_summary_empty,
     make_upstream_attempt_logger as _make_upstream_attempt_logger,
     native_sse_chunk_has_meaningful_output as _native_sse_chunk_has_meaningful_output,
@@ -53,6 +54,7 @@ def install_gemini_routes(context: ProxyRouteContext) -> None:
     _empty_response_log_message = context.empty_response_log_message
     _should_disable_model_on_empty_response = context.should_disable_model_on_empty_response
     _disable_account_model_on_empty_response = context.disable_account_model_on_empty_response
+    _mark_account_quota_exhausted_cooldown = context.mark_account_quota_exhausted_cooldown
     _extract_proxy_api_key = context.extract_proxy_api_key
     _iter_upstream_sse_bytes = context.iter_upstream_sse_bytes
     _gemini_error_response = context.gemini_error_response
@@ -407,6 +409,8 @@ def install_gemini_routes(context: ProxyRouteContext) -> None:
                         502,
                         _upstream_turn_error_message(exc),
                     )
+                if _is_retryable_quota_exhausted_turn_error(exc):
+                    _mark_account_quota_exhausted_cooldown(store, stream_account)
                 has_meaningful_output = False
             if not has_meaningful_output:
                 try:
@@ -485,6 +489,8 @@ def install_gemini_routes(context: ProxyRouteContext) -> None:
                             "retryReason": "upstream_turn_error_or_empty_response",
                         },
                     )
+                    if _is_retryable_quota_exhausted_turn_error(exc):
+                        _mark_account_quota_exhausted_cooldown(store, stream_account)
                     return _anthropic_error_response(
                         502,
                         _upstream_turn_error_message(exc),
@@ -932,6 +938,8 @@ def install_gemini_routes(context: ProxyRouteContext) -> None:
                     502,
                     _upstream_turn_error_message(turn_error),
                 )
+            if _is_retryable_quota_exhausted_turn_error(turn_error):
+                _mark_account_quota_exhausted_cooldown(store, account)
             try:
                 retry_account, retry_quota = await asyncio.to_thread(
                     _select_proxy_account,
@@ -1004,6 +1012,8 @@ def install_gemini_routes(context: ProxyRouteContext) -> None:
                         "retryReason": "upstream_turn_error",
                     },
                 )
+                if _is_retryable_quota_exhausted_turn_error(retry_turn_error):
+                    _mark_account_quota_exhausted_cooldown(store, stream_account)
                 return _native_error_response(
                     502,
                     _upstream_turn_error_message(retry_turn_error),

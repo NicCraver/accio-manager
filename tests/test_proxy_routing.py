@@ -1414,6 +1414,106 @@ class ProxyRoutingTests(unittest.TestCase):
                 ],
             )
 
+    def test_retryable_quota_exhausted_marks_account_unavailable_for_following_requests(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings(data_dir=Path(temp_dir), database_url="")
+            fake_client = _FakeProxyClient(
+                {
+                    "acc-1": [
+                        _quota_exhausted_http_error_response(),
+                        _quota_exhausted_http_error_response(),
+                    ],
+                    "acc-2": [
+                        _text_claude_stream("第二个账号第一次命中"),
+                        _text_claude_stream("第二个账号第二次命中"),
+                    ],
+                }
+            )
+
+            async def _noop_scheduler(_application):
+                return None
+
+            with patch("accio_panel.web.AccioClient", return_value=fake_client):
+                with patch("accio_panel.web._is_allowed_dynamic_model", return_value=(True, [])):
+                    with patch("accio_panel.web._quota_scheduler_loop", _noop_scheduler):
+                        app = create_app(settings)
+
+            app.state.panel_settings_store.save(
+                PanelSettings(
+                    admin_password="admin",
+                    session_secret="test-session",
+                    api_account_strategy="fill",
+                )
+            )
+            store = app.state.store
+            store.save(
+                Account(
+                    id="acc-1",
+                    name="账号1",
+                    access_token="token-1",
+                    refresh_token="refresh-1",
+                    utdid="utdid-1",
+                    fill_priority=0,
+                )
+            )
+            store.save(
+                Account(
+                    id="acc-2",
+                    name="账号2",
+                    access_token="token-2",
+                    refresh_token="refresh-2",
+                    utdid="utdid-2",
+                    fill_priority=10,
+                )
+            )
+
+            first_response, first_text = asyncio.run(
+                _invoke_anthropic_messages_route(
+                    app,
+                    headers={"x-api-key": "admin"},
+                    payload={
+                        "model": "claude-sonnet-4-6",
+                        "max_tokens": 256,
+                        "stream": False,
+                        "messages": [{"role": "user", "content": "hello-1"}],
+                    },
+                )
+            )
+            second_response, second_text = asyncio.run(
+                _invoke_anthropic_messages_route(
+                    app,
+                    headers={"x-api-key": "admin"},
+                    payload={
+                        "model": "claude-sonnet-4-6",
+                        "max_tokens": 256,
+                        "stream": False,
+                        "messages": [{"role": "user", "content": "hello-2"}],
+                    },
+                )
+            )
+
+            self.assertEqual(first_response.status_code, 200)
+            self.assertEqual(first_response.headers["x-accio-account-id"], "acc-2")
+            self.assertIn("第二个账号第一次命中", first_text)
+            self.assertEqual(second_response.status_code, 200)
+            self.assertEqual(second_response.headers["x-accio-account-id"], "acc-2")
+            self.assertIn("第二个账号第二次命中", second_text)
+            self.assertEqual(fake_client.calls, ["acc-1", "acc-2", "acc-2"])
+
+            exhausted_account = store.get_account("acc-1")
+            self.assertIsNotNone(exhausted_account)
+            self.assertTrue(exhausted_account.auto_disabled)
+            self.assertTrue(exhausted_account.manual_enabled)
+            self.assertIsNotNone(exhausted_account.next_quota_check_at)
+            self.assertEqual(
+                exhausted_account.next_quota_check_reason,
+                "上游 quota exhausted 后自动恢复重试",
+            )
+            self.assertIn(
+                "quota exhausted",
+                str(exhausted_account.auto_disabled_reason or "").lower(),
+            )
+
     def test_native_generate_content_retries_once_after_retryable_upstream_turn_error(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             settings = Settings(data_dir=Path(temp_dir), database_url="")
