@@ -138,9 +138,6 @@ def register_panel_routes(
         api_logs = api_log_store.recent(200) if current_view == "logs" else []
         dashboard_items = _build_dashboard_items(
             page_accounts,
-            client,
-            store,
-            panel_settings,
         )
         api_base_url = _request_base_url(request, settings)
         return _TEMPLATES.TemplateResponse(

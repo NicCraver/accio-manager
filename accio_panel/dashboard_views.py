@@ -1,17 +1,9 @@
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any
 
-from .app_settings import PanelSettings
-from .client import AccioClient
 from .models import Account
-from .proxy_selection import (
-    _account_status_view,
-    _build_quota_view,
-    _query_quota_with_refresh_fallback,
-)
-from .store import AccountStore
+from .proxy_selection import _account_status_view
 from .utils import format_timestamp, mask_token
 
 PAGE_SIZE_OPTIONS = (10, 20, 50)
@@ -54,56 +46,58 @@ def _build_page_numbers(current_page: int, total_pages: int) -> list[int]:
     return list(range(start, end + 1))
 
 
+def _cached_quota_view(account: Account) -> dict[str, Any]:
+    remaining = account.last_remaining_quota
+    total = account.last_total_quota
+
+    if remaining is None:
+        checked = account.last_quota_check_at is not None
+        return {
+            "success": False,
+            "total_value": 0,
+            "used_value": 0,
+            "used_text": "-",
+            "remaining_value": 0,
+            "remaining_ratio": 0,
+            "remaining_text": "获取失败" if checked else "等待巡检",
+            "reset_text": "-",
+            "level": "error",
+            "message": account.auto_disabled_reason or "",
+        }
+
+    remaining = max(0, remaining)
+    total = max(0, total or 0)
+    used = max(0, total - remaining) if total > 0 else 0
+    if total <= 0 and (used > 0 or remaining > 0):
+        total = used + remaining
+    ratio = max(0, min(100, round((remaining / total) * 100))) if total > 0 else 0
+
+    level = "low"
+    if ratio < 20:
+        level = "high"
+    elif ratio < 50:
+        level = "medium"
+
+    fmt = lambda v, t: f"{v}/{t}" if t > 0 else str(v)
+    return {
+        "success": True,
+        "total_value": total,
+        "used_value": used,
+        "used_text": fmt(used, total),
+        "remaining_value": remaining,
+        "remaining_ratio": ratio,
+        "remaining_text": fmt(remaining, total),
+        "reset_text": "-",
+        "level": level,
+        "message": "",
+    }
+
+
 def _build_dashboard_items(
     accounts: list[Account],
-    client: AccioClient,
-    store: AccountStore,
-    panel_settings: PanelSettings,
 ) -> list[dict[str, Any]]:
-    if not accounts:
-        return []
-
-    quota_map: dict[str, tuple[Account, dict[str, Any]]] = {}
-    workers = min(8, len(accounts))
-
-    with ThreadPoolExecutor(max_workers=workers) as executor:
-        future_map = {
-            executor.submit(
-                _query_quota_with_refresh_fallback,
-                store,
-                client,
-                account,
-                panel_settings,
-            ): account.id
-            for account in accounts
-        }
-        for future in as_completed(future_map):
-            account_id = future_map[future]
-            try:
-                quota_map[account_id] = future.result()
-            except Exception as exc:  # pragma: no cover
-                fallback_account = store.get_account(account_id)
-                if fallback_account is None:
-                    fallback_account = next(
-                        (candidate for candidate in accounts if candidate.id == account_id),
-                        None,
-                    )
-                if fallback_account is None:
-                    continue
-                quota_map[account_id] = (
-                    fallback_account,
-                    _build_quota_view({"success": False, "message": str(exc)}),
-                )
-
     items: list[dict[str, Any]] = []
     for account in accounts:
-        account, quota_view = quota_map.get(
-            account.id,
-            (
-                account,
-                _build_quota_view({"success": False, "message": "额度查询失败"}),
-            ),
-        )
         status = _account_status_view(account)
         items.append(
             {
@@ -120,7 +114,7 @@ def _build_dashboard_items(
                 "next_quota_check_at": account.next_quota_check_at,
                 "next_quota_check_reason": account.next_quota_check_reason,
                 "status": status,
-                "quota": quota_view,
+                "quota": _cached_quota_view(account),
             }
         )
     return items

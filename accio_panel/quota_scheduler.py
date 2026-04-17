@@ -22,6 +22,13 @@ async def _quota_scheduler_loop(application: FastAPI) -> None:
     client: AccioClient = application.state.client
     panel_settings_store: PanelSettingsStore = application.state.panel_settings_store
 
+    # 启动时重置所有账号的巡检时间，确保首轮 tick 立即触发全量检查
+    now_ts = _now_timestamp()
+    for account in store.list_accounts():
+        if account.next_quota_check_at is not None and account.next_quota_check_at > now_ts:
+            account.next_quota_check_at = now_ts
+            store.save(account)
+
     while True:
         panel_settings = panel_settings_store.load()
         now_ts = _now_timestamp()
