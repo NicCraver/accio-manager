@@ -24,6 +24,7 @@ ENABLED_ACCOUNT_CHECK_INTERVAL_SECONDS = 15 * 60
 FAILED_ACCOUNT_RETRY_SECONDS = 5 * 60
 RECOVERY_CHECK_BUFFER_SECONDS = 90
 ABNORMAL_ACCOUNT_RECOVERY_INTERVAL_SECONDS = 30 * 60
+UPSTREAM_QUOTA_EXHAUSTED_MAX_WAIT_SECONDS = 30 * 60
 UPSTREAM_QUOTA_EXHAUSTED_AUTO_DISABLED_REASON = (
     "上游返回 [429]: quota exhausted，系统已暂时跳过该账号并等待自动恢复重试。"
 )
@@ -853,11 +854,12 @@ def _plan_next_quota_check(
     if account.auto_disabled:
         if _is_upstream_quota_exhausted_cooldown(account):
             if next_billing_at is not None:
+                capped_retry_at = min(
+                    next_billing_at + RECOVERY_CHECK_BUFFER_SECONDS,
+                    now_ts + UPSTREAM_QUOTA_EXHAUSTED_MAX_WAIT_SECONDS,
+                )
                 return (
-                    max(
-                        now_ts + RECOVERY_CHECK_BUFFER_SECONDS,
-                        next_billing_at + RECOVERY_CHECK_BUFFER_SECONDS,
-                    ),
+                    max(now_ts + RECOVERY_CHECK_BUFFER_SECONDS, capped_retry_at),
                     UPSTREAM_QUOTA_EXHAUSTED_RECOVERY_REASON,
                 )
             return (
