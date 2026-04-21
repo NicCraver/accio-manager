@@ -1,10 +1,9 @@
 from __future__ import annotations
 
 import asyncio
-import itertools
 import json
 import time
-from typing import Any, Iterator
+from typing import Any
 
 from fastapi import Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
@@ -20,9 +19,8 @@ from ..anthropic_proxy import (
 from ..upstream_support import (
     anthropic_stream_chunk_has_meaningful_output as _anthropic_stream_chunk_has_meaningful_output,
     extract_upstream_turn_error_from_chunk as _extract_upstream_turn_error_from_chunk,
-    is_stream_summary_empty as _is_stream_summary_empty,
+    is_retryable_quota_exhausted_turn_error as _is_retryable_quota_exhausted_turn_error,
     make_upstream_attempt_logger as _make_upstream_attempt_logger,
-    prefetch_stream_until_meaningful as _prefetch_stream_until_meaningful,
     request_upstream_or_error,
     should_retry_upstream_turn_error as _should_retry_upstream_turn_error,
     summarize_non_stream_payload as _summarize_non_stream_payload,
@@ -30,6 +28,13 @@ from ..upstream_support import (
 )
 from ..usage_stats import UsageStatsStore
 from .context import ProxyRouteContext
+from .shared import (
+    ProxyEndpointConfig,
+    make_build_stream_attempt,
+    make_build_upstream_error_response,
+    make_record_final_log,
+    make_stream_headers,
+)
 
 
 def install_anthropic_routes(context: ProxyRouteContext) -> None:
@@ -49,6 +54,7 @@ def install_anthropic_routes(context: ProxyRouteContext) -> None:
     _empty_response_log_message = context.empty_response_log_message
     _should_disable_model_on_empty_response = context.should_disable_model_on_empty_response
     _disable_account_model_on_empty_response = context.disable_account_model_on_empty_response
+    _mark_account_quota_exhausted_cooldown = context.mark_account_quota_exhausted_cooldown
     _anthropic_error_response = context.anthropic_error_response
 
     @application.post("/v1/messages")
@@ -163,66 +169,36 @@ def install_anthropic_routes(context: ProxyRouteContext) -> None:
             max_tokens=max_tokens,
         )
 
-        def _record_final_log(
-            selected_account: Account,
-            selected_quota: dict[str, Any],
-            selected_request_id: str,
-            *,
-            stream: bool,
-            success: bool,
-            stop_reason: str,
-            message: str,
-            status_code: int,
-            input_tokens: int = 0,
-            output_tokens: int = 0,
-            empty_response: bool = False,
-            level: str | None = None,
-            extra_fields: dict[str, Any] | None = None,
-        ) -> None:
-            record_proxy_log(
-                api_log_store,
-                event="v1_messages",
-                model=model,
-                stream=stream,
-                strategy=panel_settings.api_account_strategy,
-                request_id=selected_request_id,
-                success=success,
-                stop_reason=stop_reason,
-                message=message,
-                status_code=status_code,
-                account=selected_account,
-                quota=selected_quota,
-                empty_response=empty_response,
-                messages_count=messages_count,
-                max_tokens=max_tokens,
-                input_tokens=input_tokens,
-                output_tokens=output_tokens,
-                duration_ms=int((time.perf_counter() - started_at) * 1000),
-                level=level,
-                extra_fields=extra_fields,
-            )
+        endpoint_config = ProxyEndpointConfig(
+            event="v1_messages",
+            model=model,
+            default_stop_reason="end_turn",
+            stream_complete_message="Anthropic 上游流式请求完成",
+            error_response_builder=lambda sc, msg, _sr: _anthropic_error_response(sc, msg),
+            extra_fields_extractor=lambda s: {
+                "cacheCreationInputTokens": int(s.get("cache_creation_input_tokens") or 0),
+                "cacheReadInputTokens": int(s.get("cache_read_input_tokens") or 0),
+                "textChars": int(s.get("text_chars") or 0),
+                "thinkingChars": int(s.get("thinking_chars") or 0),
+                "toolUseBlocks": int(s.get("tool_use_blocks") or 0),
+            },
+            max_tokens=max_tokens,
+            disable_on_empty_response=disable_on_empty_response,
+            cache_token_fields=["cache_creation_input_tokens", "cache_read_input_tokens"],
+        )
 
-        def _build_upstream_error_response(
-            selected_account: Account,
-            selected_quota: dict[str, Any],
-            selected_request_id: str,
-            *,
-            stream: bool,
-        ) -> Callable[[int, str, str], Response]:
-            def _handle(status_code: int, message: str, stop_reason: str) -> Response:
-                _record_final_log(
-                    selected_account,
-                    selected_quota,
-                    selected_request_id,
-                    stream=stream,
-                    success=False,
-                    stop_reason=stop_reason,
-                    message=message,
-                    status_code=status_code,
-                )
-                return _anthropic_error_response(status_code, message)
+        _record_final_log = make_record_final_log(
+            config=endpoint_config,
+            api_log_store=api_log_store,
+            panel_settings=panel_settings,
+            started_at=started_at,
+            messages_count=messages_count,
+        )
 
-            return _handle
+        _build_upstream_error_response = make_build_upstream_error_response(
+            config=endpoint_config,
+            record_final_log=_record_final_log,
+        )
 
         attempt_started_at = time.perf_counter()
         upstream_response = await request_upstream_or_error(
@@ -258,142 +234,25 @@ def install_anthropic_routes(context: ProxyRouteContext) -> None:
             return upstream_response
 
         if requested_stream:
-            def _stream_headers(
-                selected_account: Account,
-                selected_quota: dict[str, Any],
-            ) -> dict[str, str]:
-                headers = {
-                    "x-accio-account-id": selected_account.id,
-                    "x-accio-account-strategy": panel_settings.api_account_strategy,
-                }
-                if selected_quota.get("success"):
-                    headers["x-accio-account-remaining"] = str(
-                        selected_quota["remaining_value"]
-                    )
-                return headers
+            _stream_headers = make_stream_headers(
+                panel_settings=panel_settings,
+                include_remaining=True,
+            )
 
-            def _build_stream_attempt(
-                selected_account: Account,
-                selected_quota: dict[str, Any],
-                selected_response: requests.Response,
-                selected_request_id: str,
-                selected_attempt: int,
-                selected_attempt_started_at: float,
-            ) -> tuple[Iterator[bytes], bool]:
-                def record_stream_summary(summary: dict[str, Any]) -> None:
-                    usage = summary.get("usage") if isinstance(summary, dict) else {}
-                    if not isinstance(usage, dict):
-                        usage = {}
-                    empty_response = _is_stream_summary_empty(summary)
-                    if empty_response and disable_on_empty_response:
-                        _disable_account_model_on_empty_response(
-                            store,
-                            selected_account,
-                            model,
-                        )
-                    _record_attempt(
-                        selected_account,
-                        selected_quota,
-                        selected_request_id,
-                        attempt=selected_attempt,
-                        stream=True,
-                        success=not empty_response,
-                        stop_reason=(
-                            "empty_response"
-                            if empty_response
-                            else str(summary.get("stop_reason") or "end_turn")
-                        ),
-                        message=(
-                            _empty_response_log_message(
-                                model,
-                                disable_model=disable_on_empty_response,
-                            )
-                            if empty_response
-                            else "Anthropic 上游流式请求完成"
-                        ),
-                        status_code=200,
-                        input_tokens=int(usage.get("input_tokens") or 0),
-                        output_tokens=int(usage.get("output_tokens") or 0),
-                        empty_response=empty_response,
-                        duration_ms=int(
-                            (time.perf_counter() - selected_attempt_started_at) * 1000
-                        ),
-                        level="warn" if empty_response else None,
-                        extra_fields={
-                            "cacheCreationInputTokens": int(
-                                usage.get("cache_creation_input_tokens") or 0
-                            ),
-                            "cacheReadInputTokens": int(
-                                usage.get("cache_read_input_tokens") or 0
-                            ),
-                            "textChars": int(summary.get("text_chars") or 0),
-                            "thinkingChars": int(summary.get("thinking_chars") or 0),
-                            "toolUseBlocks": int(summary.get("tool_use_blocks") or 0),
-                        },
-                    )
-                    usage_stats_store.record_message(
-                        account_id=selected_account.id,
-                        model=model,
-                        input_tokens=int(usage.get("input_tokens") or 0),
-                        output_tokens=int(usage.get("output_tokens") or 0),
-                        cache_creation_input_tokens=int(usage.get("cache_creation_input_tokens") or 0),
-                        cache_read_input_tokens=int(usage.get("cache_read_input_tokens") or 0),
-                        success=True,
-                        stop_reason=str(summary.get("stop_reason") or "end_turn"),
-                    )
-                    api_log_store.record(
-                        {
-                            "level": "warn" if empty_response else "info",
-                            "event": "v1_messages",
-                            "success": True,
-                            "emptyResponse": empty_response,
-                            "accountId": selected_account.id,
-                            "accountName": selected_account.name,
-                            "fillPriority": selected_account.fill_priority,
-                            "model": model,
-                            "stream": True,
-                            "strategy": panel_settings.api_account_strategy,
-                            "requestId": selected_request_id,
-                            "message": (
-                                _empty_response_log_message(
-                                    model,
-                                    disable_model=disable_on_empty_response,
-                                )
-                                if empty_response
-                                else "流式调用完成"
-                            ),
-                            "statusCode": 200,
-                            "stopReason": str(summary.get("stop_reason") or "end_turn"),
-                            "inputTokens": int(usage.get("input_tokens") or 0),
-                            "outputTokens": int(usage.get("output_tokens") or 0),
-                            "cacheCreationInputTokens": int(usage.get("cache_creation_input_tokens") or 0),
-                            "cacheReadInputTokens": int(usage.get("cache_read_input_tokens") or 0),
-                            "remainingQuota": selected_quota.get("remaining_value"),
-                            "usedQuota": selected_quota.get("used_value"),
-                            "messagesCount": messages_count,
-                            "maxTokens": max_tokens,
-                            "textChars": int(summary.get("text_chars") or 0),
-                            "thinkingChars": int(summary.get("thinking_chars") or 0),
-                            "toolUseBlocks": int(summary.get("tool_use_blocks") or 0),
-                            "durationMs": int((time.perf_counter() - started_at) * 1000),
-                        }
-                    )
-
-                stream_bytes = iter_anthropic_sse_bytes(
-                    selected_response,
-                    model,
-                    on_complete=record_stream_summary,
-                )
-                prefetched_chunks, remaining_chunks, has_meaningful_output = (
-                    _prefetch_stream_until_meaningful(
-                        stream_bytes,
-                        chunk_has_meaningful_output=_anthropic_stream_chunk_has_meaningful_output,
-                    )
-                )
-                return (
-                    itertools.chain(prefetched_chunks, remaining_chunks),
-                    has_meaningful_output,
-                )
+            _build_stream_attempt = make_build_stream_attempt(
+                config=endpoint_config,
+                panel_settings=panel_settings,
+                store=store,
+                usage_stats_store=usage_stats_store,
+                api_log_store=api_log_store,
+                started_at=started_at,
+                messages_count=messages_count,
+                record_attempt=_record_attempt,
+                disable_account_model_on_empty_response=_disable_account_model_on_empty_response,
+                empty_response_log_message=_empty_response_log_message,
+                iter_sse_bytes=iter_anthropic_sse_bytes,
+                chunk_has_meaningful_output=_anthropic_stream_chunk_has_meaningful_output,
+            )
 
             stream_account = account
             stream_quota = quota
@@ -425,6 +284,8 @@ def install_anthropic_routes(context: ProxyRouteContext) -> None:
                         502,
                         _upstream_turn_error_message(exc),
                     )
+                if _is_retryable_quota_exhausted_turn_error(exc):
+                    _mark_account_quota_exhausted_cooldown(store, stream_account)
                 has_meaningful_output = False
             if not has_meaningful_output:
                 try:
@@ -499,6 +360,8 @@ def install_anthropic_routes(context: ProxyRouteContext) -> None:
                             "retryReason": "upstream_turn_error_or_empty_response",
                         },
                     )
+                    if _is_retryable_quota_exhausted_turn_error(exc):
+                        _mark_account_quota_exhausted_cooldown(store, stream_account)
                     return _anthropic_error_response(
                         502,
                         _upstream_turn_error_message(exc),
@@ -539,6 +402,8 @@ def install_anthropic_routes(context: ProxyRouteContext) -> None:
                     502,
                     _upstream_turn_error_message(exc),
                 )
+            if _is_retryable_quota_exhausted_turn_error(exc):
+                _mark_account_quota_exhausted_cooldown(store, account)
             should_retry = True
             retry_due_to_upstream_turn_error = True
         else:
@@ -706,6 +571,8 @@ def install_anthropic_routes(context: ProxyRouteContext) -> None:
                         ),
                     },
                 )
+                if _is_retryable_quota_exhausted_turn_error(exc):
+                    _mark_account_quota_exhausted_cooldown(store, account)
                 return _anthropic_error_response(
                     502,
                     _upstream_turn_error_message(exc),

@@ -14,7 +14,8 @@ from accio_panel.config import Settings
 from accio_panel.models import Account
 from accio_panel.mysql_storage import MySQLGateway
 from accio_panel.store import AccountStore
-from accio_panel.web import _ordered_proxy_candidates, _select_proxy_account, create_app
+from accio_panel.proxy_selection import _ordered_proxy_candidates, _select_proxy_account
+from accio_panel.web import create_app
 
 
 class _FakeSSEUpstreamResponse:
@@ -32,6 +33,17 @@ class _FakeSSEUpstreamResponse:
                 yield line
             else:
                 yield line.encode("utf-8")
+
+    def close(self):
+        self.closed = True
+
+
+class _FakeHTTPUpstreamResponse:
+    def __init__(self, status_code: int, text: str):
+        self.status_code = status_code
+        self.ok = status_code < 400
+        self.text = text
+        self.closed = False
 
     def close(self):
         self.closed = True
@@ -192,6 +204,22 @@ def _upstream_turn_error_stream(
                 "error_message": message,
             }
         ]
+    )
+
+
+def _quota_exhausted_http_error_response() -> _FakeHTTPUpstreamResponse:
+    return _FakeHTTPUpstreamResponse(
+        429,
+        json.dumps(
+            {
+                "type": "error",
+                "error": {
+                    "type": "api_error",
+                    "message": "quota exhausted",
+                },
+            },
+            ensure_ascii=False,
+        ),
     )
 
 
@@ -669,7 +697,7 @@ class ProxyRoutingTests(unittest.TestCase):
                 return None
 
             with patch("accio_panel.web.AccioClient", return_value=fake_client):
-                with patch("accio_panel.web._is_allowed_dynamic_model", return_value=(True, [])):
+                with patch("accio_panel.proxy_routes.context._is_allowed_dynamic_model_impl", return_value=(True, [])):
                     with patch("accio_panel.web._quota_scheduler_loop", _noop_scheduler):
                         app = create_app(settings)
 
@@ -755,7 +783,7 @@ class ProxyRoutingTests(unittest.TestCase):
                 return None
 
             with patch("accio_panel.web.AccioClient", return_value=fake_client):
-                with patch("accio_panel.web._is_allowed_dynamic_model", return_value=(True, [])):
+                with patch("accio_panel.proxy_routes.context._is_allowed_dynamic_model_impl", return_value=(True, [])):
                     with patch("accio_panel.web._quota_scheduler_loop", _noop_scheduler):
                         app = create_app(settings)
 
@@ -822,7 +850,7 @@ class ProxyRoutingTests(unittest.TestCase):
                 return None
 
             with patch("accio_panel.web.AccioClient", return_value=fake_client):
-                with patch("accio_panel.web._is_allowed_dynamic_model", return_value=(True, [])):
+                with patch("accio_panel.proxy_routes.context._is_allowed_dynamic_model_impl", return_value=(True, [])):
                     with patch("accio_panel.web._quota_scheduler_loop", _noop_scheduler):
                         app = create_app(settings)
 
@@ -908,7 +936,7 @@ class ProxyRoutingTests(unittest.TestCase):
                 return None
 
             with patch("accio_panel.web.AccioClient", return_value=fake_client):
-                with patch("accio_panel.web._is_allowed_dynamic_model", return_value=(True, [])):
+                with patch("accio_panel.proxy_routes.context._is_allowed_dynamic_model_impl", return_value=(True, [])):
                     with patch("accio_panel.web._quota_scheduler_loop", _noop_scheduler):
                         app = create_app(settings)
 
@@ -998,7 +1026,7 @@ class ProxyRoutingTests(unittest.TestCase):
                 return None
 
             with patch("accio_panel.web.AccioClient", return_value=fake_client):
-                with patch("accio_panel.web._is_allowed_dynamic_model", return_value=(True, [])):
+                with patch("accio_panel.proxy_routes.context._is_allowed_dynamic_model_impl", return_value=(True, [])):
                     with patch("accio_panel.web._quota_scheduler_loop", _noop_scheduler):
                         app = create_app(settings)
 
@@ -1065,7 +1093,7 @@ class ProxyRoutingTests(unittest.TestCase):
                 return None
 
             with patch("accio_panel.web.AccioClient", return_value=fake_client):
-                with patch("accio_panel.web._is_allowed_dynamic_model", return_value=(True, [])):
+                with patch("accio_panel.proxy_routes.context._is_allowed_dynamic_model_impl", return_value=(True, [])):
                     with patch("accio_panel.web._quota_scheduler_loop", _noop_scheduler):
                         app = create_app(settings)
 
@@ -1135,7 +1163,7 @@ class ProxyRoutingTests(unittest.TestCase):
                 return None
 
             with patch("accio_panel.web.AccioClient", return_value=fake_client):
-                with patch("accio_panel.web._is_allowed_dynamic_model", return_value=(True, [])):
+                with patch("accio_panel.proxy_routes.context._is_allowed_dynamic_model_impl", return_value=(True, [])):
                     with patch("accio_panel.web._quota_scheduler_loop", _noop_scheduler):
                         app = create_app(settings)
 
@@ -1226,7 +1254,7 @@ class ProxyRoutingTests(unittest.TestCase):
                 return None
 
             with patch("accio_panel.web.AccioClient", return_value=fake_client):
-                with patch("accio_panel.web._is_allowed_dynamic_model", return_value=(True, [])):
+                with patch("accio_panel.proxy_routes.context._is_allowed_dynamic_model_impl", return_value=(True, [])):
                     with patch("accio_panel.web._quota_scheduler_loop", _noop_scheduler):
                         app = create_app(settings)
 
@@ -1297,6 +1325,194 @@ class ProxyRoutingTests(unittest.TestCase):
                     ("v1_messages", 1, "acc-1", False, "upstream_turn_error"),
                     ("v1_messages", 2, "acc-2", True, "end_turn"),
                 ],
+            )
+
+    def test_anthropic_non_stream_retries_once_after_retryable_quota_exhausted_http_error(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings(data_dir=Path(temp_dir), database_url="")
+            fake_client = _FakeProxyClient(
+                {
+                    "acc-1": [_quota_exhausted_http_error_response()],
+                    "acc-2": [_text_claude_stream("第二个账号命中")],
+                }
+            )
+
+            async def _noop_scheduler(_application):
+                return None
+
+            with patch("accio_panel.web.AccioClient", return_value=fake_client):
+                with patch("accio_panel.proxy_routes.context._is_allowed_dynamic_model_impl", return_value=(True, [])):
+                    with patch("accio_panel.web._quota_scheduler_loop", _noop_scheduler):
+                        app = create_app(settings)
+
+            app.state.panel_settings_store.save(
+                PanelSettings(
+                    admin_password="admin",
+                    session_secret="test-session",
+                    api_account_strategy="fill",
+                )
+            )
+            store = app.state.store
+            store.save(
+                Account(
+                    id="acc-1",
+                    name="账号1",
+                    access_token="token-1",
+                    refresh_token="refresh-1",
+                    utdid="utdid-1",
+                    fill_priority=0,
+                )
+            )
+            store.save(
+                Account(
+                    id="acc-2",
+                    name="账号2",
+                    access_token="token-2",
+                    refresh_token="refresh-2",
+                    utdid="utdid-2",
+                    fill_priority=10,
+                )
+            )
+
+            response, response_text = asyncio.run(
+                _invoke_anthropic_messages_route(
+                    app,
+                    headers={"x-api-key": "admin"},
+                    payload={
+                        "model": "claude-sonnet-4-6",
+                        "max_tokens": 256,
+                        "stream": False,
+                        "messages": [{"role": "user", "content": "hello"}],
+                    },
+                )
+            )
+
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(response.headers["x-accio-account-id"], "acc-2")
+            self.assertIn("第二个账号命中", response_text)
+            self.assertEqual(fake_client.calls, ["acc-1", "acc-2"])
+            attempt_logs = [
+                item
+                for item in _read_api_logs(settings)
+                if item.get("phase") == "upstream_attempt"
+            ]
+            self.assertEqual(len(attempt_logs), 2)
+            self.assertEqual(attempt_logs[0]["errorCode"], "429")
+            self.assertEqual(
+                [
+                    (
+                        item.get("event"),
+                        item.get("attempt"),
+                        item.get("accountId"),
+                        item.get("success"),
+                        item.get("stopReason"),
+                    )
+                    for item in attempt_logs
+                ],
+                [
+                    ("v1_messages", 1, "acc-1", False, "upstream_turn_error"),
+                    ("v1_messages", 2, "acc-2", True, "end_turn"),
+                ],
+            )
+
+    def test_retryable_quota_exhausted_marks_account_unavailable_for_following_requests(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings(data_dir=Path(temp_dir), database_url="")
+            fake_client = _FakeProxyClient(
+                {
+                    "acc-1": [
+                        _quota_exhausted_http_error_response(),
+                        _quota_exhausted_http_error_response(),
+                    ],
+                    "acc-2": [
+                        _text_claude_stream("第二个账号第一次命中"),
+                        _text_claude_stream("第二个账号第二次命中"),
+                    ],
+                }
+            )
+
+            async def _noop_scheduler(_application):
+                return None
+
+            with patch("accio_panel.web.AccioClient", return_value=fake_client):
+                with patch("accio_panel.proxy_routes.context._is_allowed_dynamic_model_impl", return_value=(True, [])):
+                    with patch("accio_panel.web._quota_scheduler_loop", _noop_scheduler):
+                        app = create_app(settings)
+
+            app.state.panel_settings_store.save(
+                PanelSettings(
+                    admin_password="admin",
+                    session_secret="test-session",
+                    api_account_strategy="fill",
+                )
+            )
+            store = app.state.store
+            store.save(
+                Account(
+                    id="acc-1",
+                    name="账号1",
+                    access_token="token-1",
+                    refresh_token="refresh-1",
+                    utdid="utdid-1",
+                    fill_priority=0,
+                )
+            )
+            store.save(
+                Account(
+                    id="acc-2",
+                    name="账号2",
+                    access_token="token-2",
+                    refresh_token="refresh-2",
+                    utdid="utdid-2",
+                    fill_priority=10,
+                )
+            )
+
+            first_response, first_text = asyncio.run(
+                _invoke_anthropic_messages_route(
+                    app,
+                    headers={"x-api-key": "admin"},
+                    payload={
+                        "model": "claude-sonnet-4-6",
+                        "max_tokens": 256,
+                        "stream": False,
+                        "messages": [{"role": "user", "content": "hello-1"}],
+                    },
+                )
+            )
+            second_response, second_text = asyncio.run(
+                _invoke_anthropic_messages_route(
+                    app,
+                    headers={"x-api-key": "admin"},
+                    payload={
+                        "model": "claude-sonnet-4-6",
+                        "max_tokens": 256,
+                        "stream": False,
+                        "messages": [{"role": "user", "content": "hello-2"}],
+                    },
+                )
+            )
+
+            self.assertEqual(first_response.status_code, 200)
+            self.assertEqual(first_response.headers["x-accio-account-id"], "acc-2")
+            self.assertIn("第二个账号第一次命中", first_text)
+            self.assertEqual(second_response.status_code, 200)
+            self.assertEqual(second_response.headers["x-accio-account-id"], "acc-2")
+            self.assertIn("第二个账号第二次命中", second_text)
+            self.assertEqual(fake_client.calls, ["acc-1", "acc-2", "acc-2"])
+
+            exhausted_account = store.get_account("acc-1")
+            self.assertIsNotNone(exhausted_account)
+            self.assertTrue(exhausted_account.auto_disabled)
+            self.assertTrue(exhausted_account.manual_enabled)
+            self.assertIsNotNone(exhausted_account.next_quota_check_at)
+            self.assertEqual(
+                exhausted_account.next_quota_check_reason,
+                "上游 quota exhausted 后自动恢复重试",
+            )
+            self.assertIn(
+                "quota exhausted",
+                str(exhausted_account.auto_disabled_reason or "").lower(),
             )
 
     def test_native_generate_content_retries_once_after_retryable_upstream_turn_error(self):
@@ -1407,7 +1623,7 @@ class ProxyRoutingTests(unittest.TestCase):
                 return None
 
             with patch("accio_panel.web.AccioClient", return_value=fake_client):
-                with patch("accio_panel.web._is_allowed_dynamic_model", return_value=(True, [])):
+                with patch("accio_panel.proxy_routes.context._is_allowed_dynamic_model_impl", return_value=(True, [])):
                     with patch("accio_panel.web._quota_scheduler_loop", _noop_scheduler):
                         app = create_app(settings)
 
@@ -1489,7 +1705,7 @@ class ProxyRoutingTests(unittest.TestCase):
                 return None
 
             with patch("accio_panel.web.AccioClient", return_value=fake_client):
-                with patch("accio_panel.web._is_allowed_dynamic_model", return_value=(True, [])):
+                with patch("accio_panel.proxy_routes.context._is_allowed_dynamic_model_impl", return_value=(True, [])):
                     with patch("accio_panel.web._quota_scheduler_loop", _noop_scheduler):
                         app = create_app(settings)
 
@@ -1513,7 +1729,7 @@ class ProxyRoutingTests(unittest.TestCase):
             )
 
             with patch(
-                "accio_panel.web.decode_gemini_generate_content_response",
+                "accio_panel.proxy_routes.context._decode_gemini_generate_content_response",
                 return_value={
                     "candidates": [
                         {
@@ -1579,7 +1795,7 @@ class ProxyRoutingTests(unittest.TestCase):
                 return None
 
             with patch("accio_panel.web.AccioClient", return_value=fake_client):
-                with patch("accio_panel.web._is_allowed_dynamic_model", return_value=(True, [])):
+                with patch("accio_panel.proxy_routes.context._is_allowed_dynamic_model_impl", return_value=(True, [])):
                     with patch("accio_panel.web._quota_scheduler_loop", _noop_scheduler):
                         app = create_app(settings)
 
@@ -1666,7 +1882,7 @@ class ProxyRoutingTests(unittest.TestCase):
                 return None
 
             with patch("accio_panel.web.AccioClient", return_value=fake_client):
-                with patch("accio_panel.web._is_allowed_dynamic_model", return_value=(True, [])):
+                with patch("accio_panel.proxy_routes.context._is_allowed_dynamic_model_impl", return_value=(True, [])):
                     with patch("accio_panel.web._quota_scheduler_loop", _noop_scheduler):
                         app = create_app(settings)
 
@@ -1871,7 +2087,7 @@ class ProxyRoutingTests(unittest.TestCase):
                 return None
 
             with patch("accio_panel.web.AccioClient", return_value=fake_client):
-                with patch("accio_panel.web._is_allowed_dynamic_model", return_value=(True, [])):
+                with patch("accio_panel.proxy_routes.context._is_allowed_dynamic_model_impl", return_value=(True, [])):
                     with patch("accio_panel.web._quota_scheduler_loop", _noop_scheduler):
                         app = create_app(settings)
 
@@ -1896,10 +2112,10 @@ class ProxyRoutingTests(unittest.TestCase):
             selected_account = app.state.store.get_account("acc-1")
             self.assertIsNotNone(selected_account)
             with patch(
-                "accio_panel.web._select_proxy_account",
+                "accio_panel.proxy_routes.context._select_proxy_account_impl",
                 return_value=(selected_account, {"success": True, "remaining_value": None}),
             ), patch(
-                "accio_panel.web.decode_gemini_generate_content_response",
+                "accio_panel.proxy_routes.context._decode_gemini_generate_content_response",
                 return_value={
                     "candidates": [
                         {

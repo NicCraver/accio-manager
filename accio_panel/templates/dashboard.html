@@ -702,6 +702,8 @@
                 <th>时间</th>
                 <th>账号</th>
                 <th>模型</th>
+                <th>阶段</th>
+                <th>尝试</th>
                 <th>模式</th>
                 <th>结果</th>
                 <th>空回复</th>
@@ -718,6 +720,8 @@
                 <td>{{ item.createdAt }}</td>
                 <td>{{ item.accountName }}</td>
                 <td>{{ item.model }}</td>
+                <td>{{ item.phaseLabel }}</td>
+                <td>{{ item.attemptDisplay }}</td>
                 <td>{{ "流式" if item.stream else "非流式" }}</td>
                 <td>{{ "成功" if item.success else "失败" }}</td>
                 <td>{{ "是" if item.emptyResponse else "否" }}</td>
