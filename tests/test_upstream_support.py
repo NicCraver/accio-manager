@@ -10,6 +10,7 @@ from accio_panel.api_logs import ApiLogStore
 from accio_panel.models import Account
 from accio_panel.upstream_support import (
     extract_upstream_turn_error_from_chunk,
+    is_abnormal_disable_turn_error,
     make_upstream_attempt_logger,
     request_upstream_or_error,
 )
@@ -199,6 +200,61 @@ class UpstreamSupportTests(unittest.TestCase):
             self.assertEqual(turn_error.error_message, "quota exhausted")
             self.assertTrue(upstream_response.closed)
             self.assertEqual(_read_logged_entries(log_file), [])
+
+    def test_request_upstream_or_error_calls_abnormal_disable_handler_for_http_402(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            log_file = Path(temp_dir) / "api.log"
+            store = ApiLogStore(log_file)
+            record_attempt = make_upstream_attempt_logger(
+                store,
+                event="v1_messages",
+                model="claude-sonnet-4-6",
+                strategy="fill",
+                root_request_id="root-request",
+            )
+            upstream_response = _FakeUpstreamResponse(402, "gateway forbidden")
+            disabled: list[tuple[str, int, str]] = []
+
+            async def _return_error_response():
+                return upstream_response
+
+            result = asyncio.run(
+                request_upstream_or_error(
+                    _return_error_response,
+                    account=self.account,
+                    quota=self.quota,
+                    request_id="attempt-request",
+                    attempt=1,
+                    stream=False,
+                    started_at=0.0,
+                    record_attempt=record_attempt,
+                    build_error_response=lambda status, message, stop_reason: _FakeErrorResponse(
+                        status,
+                        message,
+                        stop_reason,
+                    ),
+                    abnormal_disable_handler=lambda account, status, message: disabled.append(
+                        (account.id, status, message)
+                    ),
+                )
+            )
+
+            self.assertEqual(result.status_code, 402)
+            self.assertEqual(disabled, [("acc-1", 402, "gateway forbidden")])
+            self.assertTrue(upstream_response.closed)
+
+    def test_is_abnormal_disable_turn_error_accepts_402_and_555(self):
+        turn_error_402 = extract_upstream_turn_error_from_chunk(
+            'data: {"turn_complete": true, "error_code": "402", "error_message": "x"}'
+        )
+        turn_error_555 = extract_upstream_turn_error_from_chunk(
+            'data: {"turn_complete": true, "error_code": "555", "error_message": "y"}'
+        )
+
+        assert turn_error_402 is not None
+        assert turn_error_555 is not None
+        self.assertTrue(is_abnormal_disable_turn_error(turn_error_402))
+        self.assertTrue(is_abnormal_disable_turn_error(turn_error_555))
 
     def test_request_upstream_or_error_returns_success_response_without_logging(self):
         with tempfile.TemporaryDirectory() as temp_dir:

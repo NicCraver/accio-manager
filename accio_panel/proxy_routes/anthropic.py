@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import json
 import time
-from typing import Any
 
 from fastapi import Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
@@ -18,7 +17,7 @@ from ..anthropic_proxy import (
 )
 from ..upstream_support import (
     anthropic_stream_chunk_has_meaningful_output as _anthropic_stream_chunk_has_meaningful_output,
-    extract_upstream_turn_error_from_chunk as _extract_upstream_turn_error_from_chunk,
+    is_abnormal_disable_turn_error as _is_abnormal_disable_turn_error,
     is_retryable_quota_exhausted_turn_error as _is_retryable_quota_exhausted_turn_error,
     make_upstream_attempt_logger as _make_upstream_attempt_logger,
     request_upstream_or_error,
@@ -42,8 +41,6 @@ def install_anthropic_routes(context: ProxyRouteContext) -> None:
     settings = context.settings
     client = context.client
     panel_settings_store = context.panel_settings_store
-    usage_stats_store = context.usage_stats_store
-    api_log_store = context.api_log_store
     store = context.store
     ProxySelectionError = context.ProxySelectionError
 
@@ -55,7 +52,18 @@ def install_anthropic_routes(context: ProxyRouteContext) -> None:
     _should_disable_model_on_empty_response = context.should_disable_model_on_empty_response
     _disable_account_model_on_empty_response = context.disable_account_model_on_empty_response
     _mark_account_quota_exhausted_cooldown = context.mark_account_quota_exhausted_cooldown
+    _disable_account_after_abnormal_upstream_error = (
+        context.disable_account_after_abnormal_upstream_error
+    )
     _anthropic_error_response = context.anthropic_error_response
+
+    def _abnormal_disable_on_http(account_obj, status_code, body_text):
+        _disable_account_after_abnormal_upstream_error(
+            store,
+            account_obj,
+            error_code=status_code,
+            error_message=body_text,
+        )
 
     @application.post("/v1/messages")
     async def anthropic_messages(request: Request) -> Response:
@@ -229,6 +237,7 @@ def install_anthropic_routes(context: ProxyRouteContext) -> None:
                 success=False,
                 stop_reason=stop_reason,
             ),
+            abnormal_disable_handler=_abnormal_disable_on_http,
         )
         if isinstance(upstream_response, Response):
             return upstream_response
@@ -279,6 +288,13 @@ def install_anthropic_routes(context: ProxyRouteContext) -> None:
                     duration_ms=int((time.perf_counter() - attempt_started_at) * 1000),
                     extra_fields={"errorCode": exc.error_code or None},
                 )
+                if _is_abnormal_disable_turn_error(exc):
+                    _disable_account_after_abnormal_upstream_error(
+                        store,
+                        stream_account,
+                        error_code=exc.error_code,
+                        error_message=exc.error_message,
+                    )
                 if not _should_retry_upstream_turn_error(exc):
                     return _anthropic_error_response(
                         502,
@@ -328,6 +344,7 @@ def install_anthropic_routes(context: ProxyRouteContext) -> None:
                         stream=True,
                     ),
                     retry_reason="upstream_turn_error_or_empty_response",
+                    abnormal_disable_handler=_abnormal_disable_on_http,
                 )
                 if isinstance(retry_response, Response):
                     return retry_response
@@ -360,6 +377,13 @@ def install_anthropic_routes(context: ProxyRouteContext) -> None:
                             "retryReason": "upstream_turn_error_or_empty_response",
                         },
                     )
+                    if _is_abnormal_disable_turn_error(exc):
+                        _disable_account_after_abnormal_upstream_error(
+                            store,
+                            stream_account,
+                            error_code=exc.error_code,
+                            error_message=exc.error_message,
+                        )
                     if _is_retryable_quota_exhausted_turn_error(exc):
                         _mark_account_quota_exhausted_cooldown(store, stream_account)
                     return _anthropic_error_response(
@@ -397,6 +421,13 @@ def install_anthropic_routes(context: ProxyRouteContext) -> None:
                 duration_ms=int((time.perf_counter() - attempt_started_at) * 1000),
                 extra_fields={"errorCode": exc.error_code or None},
             )
+            if _is_abnormal_disable_turn_error(exc):
+                _disable_account_after_abnormal_upstream_error(
+                    store,
+                    account,
+                    error_code=exc.error_code,
+                    error_message=exc.error_message,
+                )
             if not _should_retry_upstream_turn_error(exc):
                 return _anthropic_error_response(
                     502,
@@ -535,6 +566,7 @@ def install_anthropic_routes(context: ProxyRouteContext) -> None:
                     if retry_due_to_upstream_turn_error
                     else "empty_response"
                 ),
+                abnormal_disable_handler=_abnormal_disable_on_http,
             )
             if isinstance(retry_response, Response):
                 return retry_response
@@ -571,6 +603,13 @@ def install_anthropic_routes(context: ProxyRouteContext) -> None:
                         ),
                     },
                 )
+                if _is_abnormal_disable_turn_error(exc):
+                    _disable_account_after_abnormal_upstream_error(
+                        store,
+                        account,
+                        error_code=exc.error_code,
+                        error_message=exc.error_message,
+                    )
                 if _is_retryable_quota_exhausted_turn_error(exc):
                     _mark_account_quota_exhausted_cooldown(store, account)
                 return _anthropic_error_response(

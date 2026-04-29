@@ -3,6 +3,19 @@ from __future__ import annotations
 import random
 import time
 from datetime import datetime
+from pathlib import Path
+
+
+def read_local_accio_utdid_file() -> str | None:
+    """与官方桌面端一致的设备标识文件路径；OAuth 回调未带 utdid 时可回退。"""
+    path = Path.home() / ".accio" / "utdid"
+    if not path.is_file():
+        return None
+    try:
+        text = path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    return text or None
 
 
 def new_utdid() -> str:

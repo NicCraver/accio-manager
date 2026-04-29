@@ -32,6 +32,10 @@ from .dashboard_views import (
     _parse_page_number,
     _parse_page_size,
 )
+from .desktop_credentials import (
+    DesktopCredentialImportError,
+    load_accio_desktop_credentials,
+)
 from .gemini_proxy import (
     build_gemini_models_payload,
     gemini_error_payload,
@@ -52,8 +56,10 @@ from .proxy_selection import (
     _activation_summary_text,
     _api_account_strategy_label,
     _authorize_proxy_request,
+    _callback_utdid_from_params,
     _disabled_model_items,
     _effective_callback_url,
+    _extract_utdid_from_request_query,
     _gemini_error_response,
     _import_callback_account,
     _is_admin_authenticated,
@@ -260,6 +266,7 @@ def register_panel_routes(
             refresh_token=callback_payload.get("refreshToken", ""),
             expires_at=callback_payload.get("expiresAt"),
             cookie=callback_payload.get("cookie"),
+            utdid=_callback_utdid_from_params(callback_payload),
         )
         return JSONResponse(
             {
@@ -279,6 +286,92 @@ def register_panel_routes(
                 },
                 "quota": quota,
                 "activation": activation,
+            }
+        )
+
+    @application.post("/api/accounts/import-desktop")
+    def import_desktop_account(request: Request) -> JSONResponse:
+        if not _is_admin_authenticated(request):
+            return _unauthorized_json()
+
+        try:
+            desktop_credentials = load_accio_desktop_credentials()
+        except DesktopCredentialImportError as exc:
+            return JSONResponse(
+                {"success": False, "message": str(exc)},
+                status_code=400,
+            )
+
+        import_result = store.import_accounts([desktop_credentials.to_account_payload()])
+        if import_result["importedCount"] <= 0:
+            return JSONResponse(
+                {
+                    "success": False,
+                    "message": "未能导入官方桌面端账号",
+                    "failures": import_result["failures"],
+                },
+                status_code=400,
+            )
+
+        account: Any = None
+        expected_id = (
+            f"desktop-{desktop_credentials.user_id}"
+            if desktop_credentials.user_id
+            else ""
+        )
+        for candidate in store.list_accounts():
+            if expected_id and candidate.id == expected_id:
+                account = candidate
+                break
+            if candidate.access_token == desktop_credentials.access_token:
+                account = candidate
+                break
+            if candidate.refresh_token == desktop_credentials.refresh_token:
+                account = candidate
+                break
+
+        if account is None:
+            return JSONResponse(
+                {"success": False, "message": "账号已写入，但无法重新定位到导入结果"},
+                status_code=500,
+            )
+
+        panel_settings = panel_settings_store.load()
+        activation = client.activate_account(
+            account,
+            proxy_url=panel_settings.upstream_proxy_url,
+        )
+        account, quota = _query_quota_with_refresh_fallback(
+            store,
+            client,
+            account,
+            panel_settings,
+        )
+        created = import_result["createdCount"] > 0
+
+        return JSONResponse(
+            {
+                "success": True,
+                "message": (
+                    (
+                        "已从官方桌面端导入账号。"
+                        if created
+                        else "已从官方桌面端更新账号凭据。"
+                    )
+                    + " "
+                    + _activation_summary_text(activation)
+                ).strip(),
+                "account": {
+                    "id": account.id,
+                    "name": account.name,
+                    "utdid": account.utdid,
+                    "accessToken": mask_token(account.access_token),
+                    "expiresAtText": format_timestamp(account.expires_at),
+                    "addedAt": account.added_at,
+                },
+                "quota": quota,
+                "activation": activation,
+                "created": created,
             }
         )
 
@@ -469,6 +562,7 @@ def register_panel_routes(
             )
 
         panel_settings = panel_settings_store.load()
+        callback_utdid = _extract_utdid_from_request_query(request)
         account, quota, created, activation = _import_callback_account(
             store,
             client,
@@ -477,6 +571,7 @@ def register_panel_routes(
             refresh_token=refreshToken,
             expires_at=expiresAt,
             cookie=cookie,
+            utdid=callback_utdid,
         )
 
         return _TEMPLATES.TemplateResponse(
@@ -586,6 +681,8 @@ def register_panel_routes(
             params["expiresAt"] = str(account.expires_at)
         if account.cookie:
             params["cookie"] = account.cookie
+        if account.utdid:
+            params["utdid"] = account.utdid
         target_url = f"{callback_url}?{urlencode(params)}"
         return RedirectResponse(target_url, status_code=307)
 
@@ -1095,4 +1192,3 @@ def register_panel_routes(
                 status_code=404,
             )
         return JSONResponse({"success": True, "message": "账号已删除"})
-

@@ -1,14 +1,20 @@
-import asyncio
+import tempfile
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from accio_panel.app_settings import PanelSettings
 from accio_panel.models import Account
 from accio_panel.proxy_selection import (
+    ABNORMAL_UPSTREAM_AUTO_DISABLED_REASON_PREFIX,
     UPSTREAM_QUOTA_EXHAUSTED_RECOVERY_REASON,
+    disable_account_after_abnormal_upstream_error,
+    _is_upstream_permission_denied_result,
     _plan_next_quota_check,
+    _query_quota_with_refresh_fallback,
 )
+from accio_panel.store import AccountStore
 from accio_panel.quota_scheduler import _quota_scheduler_loop
 
 
@@ -39,7 +45,118 @@ class _StopScheduler(Exception):
     pass
 
 
+class UpstreamPermissionDeniedTests(unittest.TestCase):
+    def test_detects_402_in_message(self) -> None:
+        self.assertTrue(
+            _is_upstream_permission_denied_result(
+                {"success": False, "message": "HTTP 402: unauthorized"}
+            )
+        )
+
+    def test_401_not_treated_as_permission_product_issue(self) -> None:
+        self.assertFalse(
+            _is_upstream_permission_denied_result(
+                {"success": False, "message": "HTTP 401: token expired"}
+            )
+        )
+
+    def test_query_quota_402_skips_token_refresh_and_keeps_account_enabled(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = AccountStore(Path(tmp), None)
+            store.save(
+                Account(
+                    id="acc-402",
+                    name="账号402",
+                    access_token="access",
+                    refresh_token="refresh",
+                    utdid="utdid-1",
+                    manual_enabled=True,
+                )
+            )
+            client = Mock()
+            client.query_quota.return_value = {
+                "success": False,
+                "message": "HTTP 402: unauthorized",
+            }
+            panel = PanelSettings()
+            account = store.get_account("acc-402")
+            assert account is not None
+            acc2, quota = _query_quota_with_refresh_fallback(
+                store, client, account, panel
+            )
+            client.refresh_token.assert_not_called()
+            self.assertTrue(acc2.manual_enabled)
+            self.assertFalse(acc2.auto_disabled)
+            msg = str(quota.get("message") or "")
+            self.assertIn("402", msg)
+            self.assertIn("网关 API", msg)
+
+    def test_refresh_token_403_does_not_manual_disable_account(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = AccountStore(Path(tmp), None)
+            store.save(
+                Account(
+                    id="acc-403",
+                    name="账号403",
+                    access_token="access",
+                    refresh_token="refresh",
+                    utdid="utdid-1",
+                    manual_enabled=True,
+                )
+            )
+            client = Mock()
+            client.query_quota.return_value = {
+                "success": True,
+                "data": {"total": 0, "remaining": 0, "entitlement": {}},
+            }
+            client.refresh_token.return_value = {
+                "success": False,
+                "message": "HTTP 403: forbidden",
+            }
+            panel = PanelSettings()
+            account = store.get_account("acc-403")
+            assert account is not None
+            acc2, _quota = _query_quota_with_refresh_fallback(
+                store, client, account, panel
+            )
+            self.assertTrue(acc2.manual_enabled)
+            self.assertFalse(
+                str(acc2.auto_disabled_reason or "").strip().startswith(
+                    "获取不到额度数据，且 Token 刷新失败"
+                )
+            )
+
+
 class ProxySelectionTests(unittest.TestCase):
+    def test_disable_account_after_abnormal_upstream_error_marks_manual_disabled(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = AccountStore(Path(tmp), None)
+            store.save(
+                Account(
+                    id="acc-abnormal",
+                    name="异常账号",
+                    access_token="access",
+                    refresh_token="refresh",
+                    utdid="utdid-1",
+                    manual_enabled=True,
+                )
+            )
+            account = store.get_account("acc-abnormal")
+            assert account is not None
+
+            updated = disable_account_after_abnormal_upstream_error(
+                store,
+                account,
+                error_code=402,
+                error_message="gateway forbidden",
+            )
+
+            self.assertFalse(updated.manual_enabled)
+            self.assertFalse(updated.auto_disabled)
+            self.assertIn(ABNORMAL_UPSTREAM_AUTO_DISABLED_REASON_PREFIX, updated.auto_disabled_reason)
+            self.assertIn("[402]", str(updated.auto_disabled_reason or ""))
+            self.assertIn("gateway forbidden", str(updated.auto_disabled_reason or ""))
+
     def test_quota_exhausted_recovery_is_capped_when_next_billing_is_far_away(self):
         account = Account(
             id="acc-1",

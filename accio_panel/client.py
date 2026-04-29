@@ -3,7 +3,7 @@ from __future__ import annotations
 import secrets
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
-from urllib.parse import unquote, urlencode
+from urllib.parse import parse_qsl, unquote, urlencode, urlsplit, urlunsplit
 
 import requests
 
@@ -107,14 +107,40 @@ class AccioClient:
             "message": "" if response.ok else f"HTTP {response.status_code}",
         }
 
-    def build_login_url(self, callback_url: str, *, state: str | None = None) -> str:
+    def build_login_url(
+        self,
+        callback_url: str,
+        *,
+        state: str | None = None,
+        ttid: str | None = None,
+        login_trace_id: str | None = None,
+    ) -> str:
+        """与官方客户端一致：return_url 带 login_trace_id，登录页查询带 ttid。"""
+        trace = login_trace_id or f"login_{secrets.token_hex(16)}"
+        trace_key_present = False
+        split = urlsplit(callback_url)
+        merged: list[tuple[str, str]] = []
+        for key, value in parse_qsl(split.query, keep_blank_values=True):
+            if key.lower() == "login_trace_id":
+                trace_key_present = True
+            merged.append((key, value))
+        if not trace_key_present:
+            merged.append(("login_trace_id", trace))
+        new_query = urlencode(merged)
+        return_url = urlunsplit(
+            (split.scheme, split.netloc, split.path, new_query, split.fragment)
+        )
+
+        outer_ttid = ttid or f"ttid_{secrets.token_hex(16)}"
         query = urlencode(
             {
-                "return_url": callback_url,
+                "return_url": return_url,
                 "state": state or secrets.token_hex(32),
+                "ttid": outer_ttid,
             }
         )
-        return f"https://www.accio.com/login?{query}"
+        base = self.settings.login_base_url.rstrip("/")
+        return f"{base}/login?{query}"
 
     def query_quota(
         self,
@@ -307,6 +333,23 @@ class AccioClient:
             ],
         }
 
+    def _generate_content_headers(self, account: Account) -> dict[str, str]:
+        """与 query_quota / userinfo 一致：x-cna + 浏览器式附加头；不传整段 Cookie，避免与 body token 会话冲突致 402。"""
+        headers: dict[str, str] = {
+            **self.get_headers(
+                account.utdid,
+                accept="text/event-stream",
+                cna=self._extract_cookie_value(account.cookie, "cna"),
+                user_agent="node",
+            ),
+            "appKey": self.settings.app_key,
+            "accept-language": "*",
+            "sec-fetch-mode": "cors",
+            # 历史客户端对 ADK 曾使用裸 utdid，与 x-utdid 并存兼容
+            "utdid": account.utdid,
+        }
+        return headers
+
     def generate_content(
         self,
         account: Account,
@@ -317,14 +360,7 @@ class AccioClient:
         return self._session.post(
             f"{self.settings.base_url}/api/adk/llm/generateContent",
             json=body,
-            headers={
-                "Content-Type": "application/json",
-                "Accept": "text/event-stream",
-                "utdid": account.utdid,
-                "version": self.settings.version,
-                "appKey": self.settings.app_key,
-                "user-agent": "node",
-            },
+            headers=self._generate_content_headers(account),
             proxies=self.get_proxies(proxy_url),
             stream=True,
             timeout=(self.settings.request_timeout, 300),

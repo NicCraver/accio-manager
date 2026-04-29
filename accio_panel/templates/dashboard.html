@@ -684,6 +684,7 @@
 
     <section class="toolbar">
       <a class="link-button primary" href="{{ oauth_url }}" target="_blank" rel="noreferrer">OAuth 登录页</a>
+      <button class="button secondary" type="button" onclick="importDesktopAccount()">导入官方客户端</button>
       <button class="button secondary" type="button" onclick="openImportDialog()">导入 JSON</button>
       <button class="button success" type="button" onclick="refreshAll()">刷新全部 Token</button>
       <a class="link-button secondary" href="/dashboard?view={{ current_view }}&page={{ current_page }}&pageSize={{ page_size }}">刷新面板</a>
@@ -1303,6 +1304,25 @@
       } catch (error) {
         console.error(error);
         showToast('复制失败，请直接打开登录页');
+      }
+    }
+
+    async function importDesktopAccount() {
+      try {
+        showToast('正在从官方客户端导入账号...');
+        const response = await fetch('/api/accounts/import-desktop', {
+          method: 'POST'
+        });
+        const payload = await response.json();
+        if (!payload.success) {
+          showToast(payload.message || '导入官方客户端账号失败');
+          return;
+        }
+        showToast(payload.message || '导入成功');
+        window.setTimeout(() => window.location.reload(), 800);
+      } catch (error) {
+        console.error(error);
+        showToast('导入官方客户端账号失败，请稍后重试');
       }
     }
 

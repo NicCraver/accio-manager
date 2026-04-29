@@ -55,9 +55,19 @@ def is_retryable_quota_exhausted_turn_error(exc: UpstreamTurnError) -> bool:
     return "quota exhausted" in str(exc.error_message or "").strip().lower()
 
 
+ABNORMAL_DISABLE_ERROR_CODES = frozenset({"402", "555"})
+
+
+def is_abnormal_disable_error_code(error_code: Any) -> bool:
+    return str(error_code or "").strip() in ABNORMAL_DISABLE_ERROR_CODES
+
+
+def is_abnormal_disable_turn_error(exc: UpstreamTurnError) -> bool:
+    return is_abnormal_disable_error_code(exc.error_code)
+
+
 def should_retry_upstream_turn_error(exc: UpstreamTurnError) -> bool:
-    error_code = str(exc.error_code or "").strip()
-    if error_code == "555":
+    if is_abnormal_disable_turn_error(exc):
         return True
     return is_retryable_quota_exhausted_turn_error(exc)
 
@@ -256,6 +266,7 @@ async def request_upstream_or_error(
     build_error_response: Callable[[int, str, str], _ResponseT],
     usage_failure_recorder: Callable[[str], None] | None = None,
     retry_reason: str | None = None,
+    abnormal_disable_handler: Callable[[Account, int, str], None] | None = None,
 ) -> requests.Response | _ResponseT:
     extra_fields = {"retryReason": retry_reason} if retry_reason else None
     try:
@@ -293,6 +304,18 @@ async def request_upstream_or_error(
     if retryable_upstream_response is not None:
         return retryable_upstream_response
     upstream_text = upstream_text[:500]
+    if (
+        abnormal_disable_handler is not None
+        and is_abnormal_disable_error_code(upstream_response.status_code)
+    ):
+        try:
+            abnormal_disable_handler(
+                account,
+                int(upstream_response.status_code),
+                upstream_text,
+            )
+        except Exception:
+            pass
     if usage_failure_recorder is not None:
         usage_failure_recorder("upstream_error")
     record_attempt(

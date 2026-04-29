@@ -54,6 +54,15 @@ def _env_list(name: str) -> tuple[str, ...]:
 class Settings:
     version: str = "0.8.8"
     base_url: str = os.getenv("ACCIO_BASE_URL", "https://phoenix-gw.alibaba.com")
+    # 浏览器登录页：客户端可能打开 www.accio.com 或 www.accio-ai.com，可用环境变量与客户端一致
+    login_base_url: str = field(
+        default_factory=lambda: (
+            (os.getenv("ACCIO_LOGIN_BASE_URL") or "https://www.accio.com")
+            .strip()
+            .rstrip("/")
+            or "https://www.accio.com"
+        ),
+    )
     app_key: str = os.getenv("ACCIO_APP_KEY", "35298846").strip()
     callback_host: str = os.getenv("ACCIO_CALLBACK_HOST", "127.0.0.1")
     server_host: str = os.getenv("ACCIO_SERVER_HOST", "0.0.0.0")

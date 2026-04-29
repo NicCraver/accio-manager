@@ -17,7 +17,6 @@ from .gemini_proxy import gemini_error_payload, normalize_gemini_model_name
 from .models import Account
 from .openai_proxy import openai_error_payload
 from .store import AccountStore
-from .utils import format_timestamp, mask_token
 
 
 ENABLED_ACCOUNT_CHECK_INTERVAL_SECONDS = 15 * 60
@@ -29,6 +28,72 @@ UPSTREAM_QUOTA_EXHAUSTED_AUTO_DISABLED_REASON = (
     "上游返回 [429]: quota exhausted，系统已暂时跳过该账号并等待自动恢复重试。"
 )
 UPSTREAM_QUOTA_EXHAUSTED_RECOVERY_REASON = "上游 quota exhausted 后自动恢复重试"
+ABNORMAL_UPSTREAM_AUTO_DISABLED_REASON_PREFIX = "上游返回异常错误"
+
+# 额度/刷新接口返回 402/403 等时：多为套餐或网关权限，不是「Token 坏了」；勿自动关账号误导用户
+_UPSTREAM_API_PERMISSION_HINT = (
+    "【说明】这通常表示当前账号对 Accio 网关 API（查额度、对话等）无权限或权益不足，"
+    "与能否在网页完成 OAuth 登录不是同一回事。请确认套餐/邀请/地区是否包含 API 能力，"
+    "或改用官方桌面端导入同一账号。"
+)
+
+
+def _is_upstream_permission_denied_result(result: dict[str, Any]) -> bool:
+    """识别上游权限/付费类错误；不含 401（多属会话过期，仍应尝试 refresh）。"""
+    if not isinstance(result, dict):
+        return False
+    parts: list[str] = []
+
+    def _add(value: Any) -> None:
+        if value is None or value is False:
+            return
+        if isinstance(value, str) and value.strip():
+            parts.append(value)
+        elif isinstance(value, (int, float)) and not isinstance(value, bool):
+            parts.append(str(int(value)))
+
+    _add(result.get("message"))
+    _add(result.get("code"))
+    _add(result.get("errorCode"))
+    err = result.get("error")
+    if isinstance(err, dict):
+        _add(err.get("message"))
+        _add(err.get("code"))
+    data = result.get("data")
+    if isinstance(data, dict):
+        _add(data.get("message"))
+        _add(data.get("code"))
+
+    blob = " ".join(parts).lower()
+    if "402" in blob or "403" in blob:
+        return True
+    if any(
+        key in blob
+        for key in (
+            "unauthorized",
+            "permission denied",
+            "access denied",
+            "forbidden",
+            "not entitled",
+        )
+    ):
+        return True
+    cn = "".join(parts)
+    for needle in ("无权限", "未授权", "没有权限", "权限不足", "无权访问"):
+        if needle in cn:
+            return True
+    return False
+
+
+def _quota_result_with_permission_hint(result: dict[str, Any]) -> dict[str, Any]:
+    merged: dict[str, Any] = dict(result) if isinstance(result, dict) else {
+        "success": False,
+        "message": "",
+    }
+    base = str(merged.get("message") or "").strip()
+    hint = _UPSTREAM_API_PERMISSION_HINT
+    merged["message"] = f"{base}\n\n{hint}" if base else hint
+    return merged
 
 
 class ProxySelectionError(Exception):
@@ -68,6 +133,24 @@ def _effective_callback_url(settings: Settings, panel_settings: PanelSettings) -
 
 def _effective_api_base_url(settings: Settings, panel_settings: PanelSettings) -> str:
     return _local_base_url(settings)
+
+
+def _callback_utdid_from_params(params: dict[str, str]) -> str | None:
+    for key, value in params.items():
+        if str(key or "").strip().lower() == "utdid":
+            text = str(value or "").strip()
+            if text:
+                return text
+    return None
+
+
+def _extract_utdid_from_request_query(request: Request) -> str | None:
+    for key, value in request.query_params.multi_items():
+        if str(key or "").strip().lower() == "utdid":
+            text = str(value or "").strip()
+            if text:
+                return text
+    return None
 
 
 def _parse_callback_payload(callback_value: str) -> dict[str, str]:
@@ -121,12 +204,14 @@ def _import_callback_account(
     refresh_token: str,
     expires_at: str | int | None,
     cookie: str | None,
+    utdid: str | None = None,
 ) -> tuple[Account, dict[str, Any], bool, dict[str, Any]]:
     account, created = store.upsert_from_callback(
         access_token=access_token,
         refresh_token=refresh_token,
         expires_at=expires_at,
         cookie=cookie,
+        utdid=utdid,
     )
     activation = _activate_callback_account(client, account, panel_settings)
     account, quota = _query_quota_with_refresh_fallback(
@@ -455,6 +540,23 @@ def _refresh_token(
     )
 
 
+def disable_account_after_abnormal_upstream_error(
+    store: AccountStore,
+    account: Account,
+    *,
+    error_code: str | int,
+    error_message: str = "",
+) -> Account:
+    code_text = str(error_code or "").strip() or "unknown"
+    detail = str(error_message or "").strip()
+    suffix = f"：{detail}" if detail else ""
+    reason = (
+        f"{ABNORMAL_UPSTREAM_AUTO_DISABLED_REASON_PREFIX} [{code_text}]{suffix}。"
+        "系统已自动禁用该账号，请手动处理。"
+    )
+    return _disable_account_after_refresh_failure(store, account, reason)
+
+
 def _disable_account_after_refresh_failure(
     store: AccountStore,
     account: Account,
@@ -531,8 +633,28 @@ def _query_quota_with_refresh_fallback(
     quota_failed = not quota_result.get("success")
     fail_label = "额度查询失败" if quota_failed else "获取不到额度数据"
 
+    if _is_upstream_permission_denied_result(quota_result):
+        return _apply_quota_result(
+            store,
+            account,
+            _quota_result_with_permission_hint(quota_result),
+            panel_settings,
+        )
+
     refresh_result = _refresh_token(client, account, panel_settings)
     if not refresh_result.get("success"):
+        if _is_upstream_permission_denied_result(refresh_result):
+            merged = {
+                "success": False,
+                "message": str(refresh_result.get("message") or ""),
+                "data": quota_result.get("data"),
+            }
+            return _apply_quota_result(
+                store,
+                account,
+                _quota_result_with_permission_hint(merged),
+                panel_settings,
+            )
         reason = (
             f"{fail_label}，且 Token 刷新失败："
             f"{refresh_result.get('message') or '刷新失败'}。系统已自动禁用该账号，请手动处理。"
@@ -560,6 +682,14 @@ def _query_quota_with_refresh_fallback(
         account, quota = _apply_quota_result(store, account, retried_quota_result, panel_settings)
         quota["message"] = quota["message"] or f"{fail_label}后已自动刷新 Token 并恢复。"
         return account, quota
+
+    if _is_upstream_permission_denied_result(retried_quota_result):
+        return _apply_quota_result(
+            store,
+            account,
+            _quota_result_with_permission_hint(retried_quota_result),
+            panel_settings,
+        )
 
     reason = (
         f"{fail_label}，已自动刷新 Token 并重试，但仍获取不到额度数据。"

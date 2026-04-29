@@ -17,7 +17,7 @@ from .models import (
     normalize_timestamp,
     now_text,
 )
-from .utils import new_utdid
+from .utils import new_utdid, read_local_accio_utdid_file
 
 
 class BaseAccountStore:
@@ -203,7 +203,13 @@ class BaseAccountStore:
         refresh_token: str,
         expires_at: str | int | None,
         cookie: str | None,
+        utdid: str | None = None,
     ) -> tuple[Account, bool]:
+        explicit_utdid = str(utdid or "").strip() or None
+        new_account_utdid = (
+            explicit_utdid or read_local_accio_utdid_file() or new_utdid()
+        )
+
         with self._lock:
             accounts = self._read_all_unlocked()
             now = now_text()
@@ -213,6 +219,8 @@ class BaseAccountStore:
                     account.refresh_token = refresh_token
                     account.expires_at = normalize_timestamp(expires_at)
                     account.cookie = cookie or account.cookie
+                    if explicit_utdid:
+                        account.utdid = explicit_utdid
                     account.updated_at = now
                     self._write_account_unlocked(account)
                     return account, False
@@ -221,6 +229,8 @@ class BaseAccountStore:
                     account.access_token = access_token
                     account.expires_at = normalize_timestamp(expires_at)
                     account.cookie = cookie or account.cookie
+                    if explicit_utdid:
+                        account.utdid = explicit_utdid
                     account.updated_at = now
                     self._write_account_unlocked(account)
                     return account, False
@@ -229,6 +239,8 @@ class BaseAccountStore:
                     account.access_token = access_token
                     account.refresh_token = refresh_token
                     account.expires_at = normalize_timestamp(expires_at)
+                    if explicit_utdid:
+                        account.utdid = explicit_utdid
                     account.updated_at = now
                     self._write_account_unlocked(account)
                     return account, False
@@ -239,7 +251,7 @@ class BaseAccountStore:
                 name=self._next_account_name(accounts),
                 access_token=access_token,
                 refresh_token=refresh_token,
-                utdid=new_utdid(),
+                utdid=new_account_utdid,
                 fill_priority=self._next_fill_priority(accounts),
                 expires_at=normalize_timestamp(expires_at),
                 cookie=cookie,

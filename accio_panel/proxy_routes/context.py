@@ -29,6 +29,7 @@ from ..proxy_selection import (
     _openai_error_response as _openai_error_response_impl,
     _select_proxy_account as _select_proxy_account_impl,
     _should_disable_model_on_empty_response as _should_disable_model_on_empty_response_impl,
+    disable_account_after_abnormal_upstream_error as _disable_account_after_abnormal_upstream_error_impl,
 )
 from ..store import AccountStore
 from ..usage_stats import UsageStatsStore
@@ -80,6 +81,9 @@ class ProxyRouteContext:
 
     def mark_account_quota_exhausted_cooldown(self, *args: Any, **kwargs: Any):
         return _mark_account_quota_exhausted_cooldown_impl(*args, **kwargs)
+
+    def disable_account_after_abnormal_upstream_error(self, *args: Any, **kwargs: Any):
+        return _disable_account_after_abnormal_upstream_error_impl(*args, **kwargs)
 
     def extract_proxy_api_key(self, *args: Any, **kwargs: Any):
         return _extract_proxy_api_key_impl(*args, **kwargs)
